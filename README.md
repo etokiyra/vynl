@@ -27,8 +27,6 @@ transparent terminals like kitty, foot, or Alacritty.
 
 <div align="center">
 
-*[ screenshot / gif of the deck in action goes here ]*
-
 </div>
 
 ---
@@ -197,7 +195,7 @@ rendering details.
 
 ## License
 
-MIT — see [LICENSE](LICENSE).
+GPLv3 — see [LICENSE](LICENSE).
 
 <div align="center">
 
