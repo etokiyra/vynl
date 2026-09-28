@@ -37,8 +37,9 @@ transparent terminals like kitty, foot, or Alacritty.
   slow-down/speed-up effect
 - 💿 **Animated vinyl deck** — a genuinely circular, rotating record rendered
   from real coordinate geometry, not ASCII art templates
-- 📊 **Reactive amplitude visualizer** — a dense, gradient bar spectrum that
-  responds to the actual audio buffer in real time
+- 📊 **Reactive amplitude visualizer** — an RMS-driven procedural animation
+  (per-column sine shaping scaled by RMS); not a spectrum analyzer. Only the
+  stereo L/R VU meters and level readouts are directly signal-derived
 - 🎛️ **3-band EQ** — low / mid / high gain control, driven by lightweight
   single-pole filters suited for real-time playback
 - 📚 **Local library browser** — scans a folder for supported formats, reads
