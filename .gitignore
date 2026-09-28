@@ -1,0 +1,5 @@
+/vynl
+/bin/
+*.test
+*.out
+*.exe
