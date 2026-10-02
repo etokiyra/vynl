@@ -299,6 +299,14 @@ func (m Model) updateKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	if key == "ctrl+c" {
 		return m, tea.Quit
 	}
+	if m.showHelp {
+		m.showHelp = false
+		return m, nil
+	}
+	// Boundary/page navigation works in both the library and the search box.
+	if m.handleNavigation(key) {
+		return m, nil
+	}
 	if m.searching {
 		switch key {
 		case "esc":
@@ -332,11 +340,6 @@ func (m Model) updateKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			}
 			return m, nil
 		}
-	}
-
-	if m.showHelp {
-		m.showHelp = false
-		return m, nil
 	}
 
 	keys := m.config.Keybindings
@@ -625,6 +628,8 @@ func (m Model) helpEntries() []helpEntry {
 		{keyLabel(keys.Sort), "Cycle library sort order"},
 		{keyLabel(keys.Rescan), "Rescan library"},
 		{keyLabel(keys.NowPlaying), "Jump to playing track"},
+		{keyLabel(keys.Top) + " / " + keyLabel(keys.Bottom), "First / last track"},
+		{keyLabel(keys.PageUp) + " / " + keyLabel(keys.PageDown), "Page up / down"},
 		{keyLabel(keys.EQLow) + " " + keyLabel(keys.EQMid) + " " + keyLabel(keys.EQHigh), "Select EQ band"},
 		{keyLabel(keys.EQGainUp) + " " + keyLabel(keys.EQGainDown), "Adjust selected EQ band"},
 		{"TAB", "Switch focus"},
@@ -770,6 +775,13 @@ func (m Model) deckPanel(width, height int, p palette) string {
 	if m.status.Repeat != player.RepeatOff {
 		modes = append(modes, "REPEAT "+strings.ToUpper(string(m.status.Repeat)))
 	}
+	if m.status.ReplayGain != "" && m.status.ReplayGain != "off" {
+		rg := "RG " + strings.ToUpper(m.status.ReplayGain)
+		if m.status.TrackGainDB != 0 {
+			rg += fmt.Sprintf(" %+.1fdB", m.status.TrackGainDB)
+		}
+		modes = append(modes, rg)
+	}
 	baseLines = append(baseLines, marker+"  "+p.muted.Render(strings.Join(modes, "  ")))
 	baseLines = append(baseLines, p.text.Render(truncate(controlText, inner, "~")))
 	if m.status.Err != "" {
@@ -910,6 +922,39 @@ func (m *Model) moveSelection(delta int) {
 		return
 	}
 	m.selected = (m.selected + delta + len(m.visible)) % len(m.visible)
+}
+
+// moveSelectionTo clamps the cursor to a position in the filtered list.
+func (m *Model) moveSelectionTo(position int) {
+	if len(m.visible) == 0 {
+		return
+	}
+	m.selected = max(0, min(len(m.visible)-1, position))
+}
+
+// libraryPageSize approximates how many tracks the library panel shows, used by
+// PgUp/PgDn. Home/End jump exactly, so an approximate page is enough.
+func (m Model) libraryPageSize() int {
+	return max(1, m.height/3)
+}
+
+// handleNavigation applies Home/End/PgUp/PgDn to the library cursor. It reports
+// whether the key was a navigation binding so callers can stop processing it.
+func (m *Model) handleNavigation(key string) bool {
+	keys := m.config.Keybindings
+	switch key {
+	case keys.Top:
+		m.moveSelectionTo(0)
+	case keys.Bottom:
+		m.moveSelectionTo(len(m.visible) - 1)
+	case keys.PageUp:
+		m.moveSelectionTo(m.selected - m.libraryPageSize())
+	case keys.PageDown:
+		m.moveSelectionTo(m.selected + m.libraryPageSize())
+	default:
+		return false
+	}
+	return true
 }
 
 // selectPlaying moves the library cursor onto the currently loaded track when it

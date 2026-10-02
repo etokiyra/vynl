@@ -42,7 +42,8 @@ transparent terminals like kitty, foot, or Alacritty.
   the visualizer; the stereo L/R VU meters and numeric level readouts are
   signal-derived separately
 - 🎛️ **3-band EQ** — low / mid / high gain from a 3-way Linkwitz-Riley
-  crossover (4th-order biquad sections), with a soft limiter so EQ/volume boosts
+  crossover (4th-order biquad sections; configurable crossover frequencies),
+  with a soft limiter so EQ/volume boosts
   can't hard-clip; a flat EQ stays exactly transparent
 - 🔀 **Shuffle, repeat & transport** — shuffle the play order, cycle repeat
   off / all / one, and mute, restart, or seek from the keyboard
@@ -57,6 +58,9 @@ transparent terminals like kitty, foot, or Alacritty.
   present), streaming the new list's tags in through the same async path
 - 🔊 **Stereo L/R level meters** and live track metadata (format, bitrate,
   sample rate, file size)
+- 📈 **Optional ReplayGain** — normalize loudness from `replaygain_track_gain`/
+  `replaygain_album_gain` tags (Vorbis comments and ID3v2 TXXX), with track or
+  album mode and a preamp; off by default
 - ⌨️ **Discoverable keymap** — context-sensitive footer hints plus a full-screen
   `?` keybinding reference
 - 🖥️ **Responsive layout** — side-by-side deck and library on wide terminals, a
@@ -129,6 +133,8 @@ vynl -version
 | `/`           | Search library                   |
 | `O`           | Cycle sort: path → title → artist → album |
 | `G`           | Jump the library cursor to the playing track |
+| `Home` / `End` | Jump to the first / last track in the list |
+| `PgUp` / `PgDn` | Page up / down the track list       |
 | `F5`          | Rescan the music folder                   |
 | `?`           | Show the full keybinding help    |
 | `Ctrl+C`      | Quit (always, even while searching) |
@@ -166,6 +172,14 @@ tempo  = 0.05
 pitch  = 1.0
 eq     = 0.1
 
+[eq]
+low_hz  = 250.0
+high_hz = 4000.0
+
+[playback]
+replaygain = "off"
+preamp_db  = 0.0
+
 [keybindings]
 toggle        = " "
 stop          = "s"
@@ -188,6 +202,10 @@ repeat        = "c"
 sort          = "o"
 rescan        = "f5"
 now_playing   = "g"
+top           = "home"
+bottom        = "end"
+page_up       = "pgup"
+page_down     = "pgdown"
 search        = "/"
 quit          = "q"
 eq_low        = "1"
@@ -204,6 +222,18 @@ each key moves: seek in seconds, volume as a 0–1 fraction, tempo as a speed
 multiple, pitch in semitones, and EQ gain in band units. A non-positive step
 silently falls back to its default. VYNL never paints a background colour, so
 there is no `background` key — transparency is intentional.
+
+The `[eq]` table sets the 3-band tone control's crossover points: `low_hz` is
+the low/mid boundary and `high_hz` the mid/high boundary (defaults 250 and
+4000 Hz). Invalid, reversed, or out-of-band values fall back to the defaults.
+
+The `[playback]` table controls optional loudness normalization. Set
+`replaygain = "track"` (or `"album"` to prefer each file's album gain, falling
+back to track gain) to apply the ReplayGain values stored in the file's tags;
+`preamp_db` adds an overall offset (clamped to ±12 dB). The default `"off"`
+leaves playback untouched. A file with no ReplayGain tags, or with malformed
+values, plays normally. While normalization is active the deck shows `RG TRACK`
+or `RG ALBUM` with the applied gain.
 
 VYNL also remembers your volume, mute, EQ, shuffle, vinyl, and repeat settings
 across runs. It writes them to a separate `state.toml` beside the config file
@@ -259,8 +289,13 @@ command/status channels.
   the whole track, so long files no longer use significant RAM. The tradeoff is
   that a distant seek waits for the decoder to reposition and refill, which
   shows as brief buffering; seeks inside the resident window are instant
-- The 3-band EQ is a fixed-crossover design (250 Hz / 4 kHz), not a parametric
-  EQ; the crossover frequencies are not user-configurable
+- The 3-band EQ uses fixed-slope Linkwitz-Riley crossovers (the crossover
+  frequencies are configurable via `[eq] low_hz`/`high_hz`, but the slope is
+  fixed); it is not a parametric EQ
+- ReplayGain is optional and off by default. It uses the ReplayGain gain tags
+  (not EBU R128/Opus loudness tags), album mode reads each file's own album-gain
+  tag rather than aggregating a library, and boosted tracks rely on the soft
+  limiter rather than peak-based clipping prevention
 - Volume, mute, EQ, shuffle, vinyl, and repeat are saved to a separate
   `state.toml` and restored on the next run; a corrupt state file falls back to
   defaults with a warning. The current track and playback position are not
@@ -306,8 +341,9 @@ order.
 - [x] **Biquad/shelving EQ** — the 3-band EQ now uses a 3-way Linkwitz-Riley
       crossover (4th-order biquad sections) for much steeper, more musical tone
       control while keeping a flat EQ transparent
-- [ ] **Loudness normalization** — optional ReplayGain-style per-track gain for
-      consistent levels
+- [x] **Loudness normalization** — optional ReplayGain track/album gain from
+      Vorbis/ID3 tags, with a preamp and off by default; malformed or missing
+      tags are ignored per track
 - [x] **Fully configurable keys and steps** — the EQ keys and the
       seek/volume/tempo/pitch/EQ step sizes are exposed via `[keybindings]` and
       `[steps]`

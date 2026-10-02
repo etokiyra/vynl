@@ -68,6 +68,11 @@ func main() {
 		Shuffle: state.Shuffle,
 		Vinyl:   state.Vinyl,
 		Repeat:  player.RepeatMode(state.Repeat),
+		// ReplayGain is a config preference (not persisted runtime state).
+		ReplayGain: cfg.Playback.ReplayGain,
+		PreampDB:   cfg.Playback.PreampDB,
+		EQLowHz:    cfg.EQ.LowHz,
+		EQHighHz:   cfg.EQ.HighHz,
 	})
 	if err != nil {
 		log.Fatal(err)

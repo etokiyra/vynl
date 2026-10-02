@@ -2,6 +2,7 @@ package player
 
 import (
 	"encoding/binary"
+	"math"
 	"os"
 	"path/filepath"
 	"testing"
@@ -443,6 +444,66 @@ func TestReplaceTracksIgnoresEmptyList(t *testing.T) {
 	}
 }
 
+// TestReplaceTracksCopiesInput guards against sharing the track-slice backing
+// array with the UI. The UI updates display metadata in place as tags stream in,
+// so a shared array would race the engine's per-tick publish.
+func TestReplaceTracksCopiesInput(t *testing.T) {
+	replacement := []library.Track{{Path: "a"}, {Path: "b"}}
+	engine := &Engine{
+		tracks:  []library.Track{{Path: "old"}},
+		updates: make(chan Status, 1),
+	}
+	engine.order = newPlayOrder(1)
+
+	engine.replaceTracks(replacement, 1)
+	if len(engine.tracks) != 2 || engine.tracks[1].Path != "b" {
+		t.Fatalf("replacement not applied: %+v", engine.tracks)
+	}
+
+	// Simulate a UI tag update mutating the caller's slice in place.
+	replacement[0].Title = "tagged in the UI"
+	replacement[1].Path = "changed"
+	if engine.tracks[0].Title != "" || engine.tracks[1].Path != "b" {
+		t.Fatalf("engine track slice shares backing with the caller: %+v", engine.tracks)
+	}
+}
+
+func TestCloneTracksIsIndependent(t *testing.T) {
+	source := []library.Track{{Path: "a"}, {Path: "b"}}
+	copied := cloneTracks(source)
+	source[0].Path = "mutated"
+	if copied[0].Path != "a" || len(copied) != 2 {
+		t.Fatalf("cloneTracks shares backing: %+v", copied)
+	}
+}
+
+// TestReplaceTracksConcurrentTagUpdatesAreRaceFree exercises the exact race the
+// clone prevents: the UI mutating its list in place while the engine publishes.
+// Run under -race, this fails loudly if the engine ever shares the backing array.
+func TestReplaceTracksConcurrentTagUpdatesAreRaceFree(t *testing.T) {
+	replacement := []library.Track{{Path: "a"}, {Path: "b"}}
+	engine := &Engine{
+		tracks:  []library.Track{{Path: "old"}},
+		updates: make(chan Status, 1),
+	}
+	engine.order = newPlayOrder(1)
+	engine.replaceTracks(replacement, 1)
+
+	const iterations = 2000
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		for i := 0; i < iterations; i++ {
+			engine.publish()
+		}
+	}()
+	for i := 0; i < iterations; i++ {
+		replacement[0].Title = "tagged"
+		replacement[1].Path = "b"
+	}
+	<-done
+}
+
 func TestPublishCarriesRevisionAndPathKeyedNextTrack(t *testing.T) {
 	engine := &Engine{
 		tracks:   []library.Track{{Path: "a", Title: "A"}, {Path: "b", Title: "B"}},
@@ -548,6 +609,61 @@ func TestEffectiveVolumeRespectsMute(t *testing.T) {
 	engine.muted = false
 	if got := engine.effectiveVolume(); got != 0.4 {
 		t.Fatalf("unmuted effective volume = %.2f, want 0.4", got)
+	}
+}
+
+// TestTrackGainModes covers the ReplayGain policy: mode selection, album
+// fallback, preamp, missing metadata, and the off switch.
+func TestTrackGainModes(t *testing.T) {
+	tag := library.ReplayGain{TrackDB: -6, AlbumDB: -2, HasTrack: true, HasAlbum: true}
+
+	engine := &Engine{replayGain: "off"}
+	if got := engine.trackGain(tag); got != 1 {
+		t.Fatalf("off gain = %v, want 1", got)
+	}
+
+	engine.replayGain = "track"
+	if got := engine.trackGain(tag); math.Abs(got-0.501187) > 1e-5 {
+		t.Fatalf("track gain = %v, want 10^(-6/20)", got)
+	}
+	engine.replayGain = "album"
+	if got := engine.trackGain(tag); math.Abs(got-0.794328) > 1e-5 {
+		t.Fatalf("album gain = %v, want 10^(-2/20)", got)
+	}
+
+	// Album mode falls back to the track gain when no album tag is present.
+	if got := engine.trackGain(library.ReplayGain{TrackDB: -6, HasTrack: true}); math.Abs(got-0.501187) > 1e-5 {
+		t.Fatalf("album fallback gain = %v, want 10^(-6/20)", got)
+	}
+	if got := engine.trackGain(library.ReplayGain{}); got != 1 {
+		t.Fatalf("untagged gain = %v, want 1", got)
+	}
+
+	// Preamp is added before conversion; -6 + 6 = 0 dB.
+	engine.replayGain = "track"
+	engine.preampDB = 6
+	if got := engine.trackGain(tag); math.Abs(got-1) > 1e-5 {
+		t.Fatalf("preamp gain = %v, want 1 after +6 dB preamp", got)
+	}
+}
+
+func TestApplyInitialNormalizesReplayGain(t *testing.T) {
+	engine := &Engine{tracks: make([]library.Track, 2)}
+	engine.applyInitial(InitialState{ReplayGain: "ALBUM", PreampDB: 99})
+	if engine.replayGain != "album" || engine.preampDB != 12 {
+		t.Fatalf("replaygain = %q preamp %v, want album/12", engine.replayGain, engine.preampDB)
+	}
+	engine.applyInitial(InitialState{ReplayGain: "bogus"})
+	if engine.replayGain != "off" {
+		t.Fatalf("bogus mode = %q, want off", engine.replayGain)
+	}
+}
+
+func TestApplyInitialStoresEQCrossover(t *testing.T) {
+	engine := &Engine{tracks: make([]library.Track, 2)}
+	engine.applyInitial(InitialState{EQLowHz: 300, EQHighHz: 3000})
+	if engine.eqLowHz != 300 || engine.eqHighHz != 3000 {
+		t.Fatalf("crossover = %v/%v, want 300/3000", engine.eqLowHz, engine.eqHighHz)
 	}
 }
 

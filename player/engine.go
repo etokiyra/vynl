@@ -85,6 +85,11 @@ type Status struct {
 	BassRMS    float64
 	Spectrum   [SpectrumBands]float64
 	Err        string
+	// ReplayGain is the active loudness-normalization mode ("off"/"track"/
+	// "album") and TrackGainDB is the gain actually applied to the loaded
+	// track (0 when normalization is off or the track has no metadata).
+	ReplayGain  string
+	TrackGainDB float64
 	// Skipped is the number of unplayable tracks auto-skipped to reach the
 	// loaded one (0 when the loaded track opened cleanly). It is informational:
 	// the deck surfaces it so a silent jump over a corrupt file is explained.
@@ -116,6 +121,11 @@ type Engine struct {
 	errText      string
 	skipped      int
 	sampleRate   int
+	replayGain   string
+	preampDB     float64
+	trackGainDB  float64
+	eqLowHz      float64
+	eqHighHz     float64
 	analyzer     *spectrumAnalyzer
 	waveform     [analyzerSize]float32
 	spectrum     [SpectrumBands]float64
@@ -130,9 +140,10 @@ type Engine struct {
 	persist   PersistState
 }
 
-// InitialState carries the playback settings restored from the persisted state
-// file. It is expected to be fully populated; config.DefaultState()/LoadState
-// provide sane values.
+// InitialState carries the playback settings applied when the engine starts.
+// Most come from the persisted state file (config.DefaultState/LoadState); the
+// ReplayGain mode and preamp come from the config file's [playback] table. It is
+// expected to be fully populated.
 type InitialState struct {
 	Volume  float64
 	Muted   bool
@@ -140,6 +151,14 @@ type InitialState struct {
 	Shuffle bool
 	Vinyl   bool
 	Repeat  RepeatMode
+	// ReplayGain is the loudness-normalization mode ("off"/"track"/"album")
+	// and PreampDB is added to the selected gain.
+	ReplayGain string
+	PreampDB   float64
+	// EQLowHz/EQHighHz are the 3-band EQ's crossover frequencies. Zero values
+	// (e.g. from tests) leave the transport's defaults in place.
+	EQLowHz  float64
+	EQHighHz float64
 }
 
 // PersistState is the subset of engine state that is remembered across runs.
@@ -161,7 +180,7 @@ func NewEngine(tracks []library.Track, initial InitialState) (*Engine, error) {
 		return nil, fmt.Errorf("initialize audio output: %w", err)
 	}
 	e := &Engine{
-		tracks: tracks, commands: make(chan Command, 32), updates: make(chan Status, 1),
+		tracks: cloneTracks(tracks), commands: make(chan Command, 32), updates: make(chan Status, 1),
 		speed:    1,
 		analyzer: newSpectrumAnalyzer(analyzerSize, outputRate),
 		stop:     make(chan struct{}), done: make(chan struct{}),
@@ -186,6 +205,10 @@ func (e *Engine) applyInitial(initial InitialState) {
 	if e.repeat != RepeatOff && e.repeat != RepeatAll && e.repeat != RepeatOne {
 		e.repeat = RepeatAll
 	}
+	e.replayGain = normalizeReplayGain(initial.ReplayGain)
+	e.preampDB = clamp(initial.PreampDB, -12, 12)
+	e.eqLowHz = initial.EQLowHz
+	e.eqHighHz = initial.EQHighHz
 	if e.speed == 0 {
 		e.speed = 1
 	}
@@ -352,6 +375,16 @@ func (e *Engine) handle(command Command) {
 	e.publish()
 }
 
+// cloneTracks returns an independent copy of tracks. The engine must own its
+// slice: the UI mutates its track list in place as tag metadata streams in on
+// the Bubble Tea event loop, and the engine copies the current track every tick
+// (publish), so sharing the backing array would be a data race. The engine only
+// needs paths for identity and titles as a display fallback; the UI renders its
+// own tagged copy.
+func cloneTracks(tracks []library.Track) []library.Track {
+	return append([]library.Track(nil), tracks...)
+}
+
 // planTrackSwap decides how a replacement track list affects the loaded track.
 // It matches by path (the stable identity across a rescan); when the current
 // path is empty or absent it returns (0, false), meaning playback should stop
@@ -387,7 +420,7 @@ func (e *Engine) replaceTracks(tracks []library.Track, revision int) {
 		currentPath = e.tracks[e.index].Path
 	}
 	index, keep := planTrackSwap(currentPath, tracks)
-	e.tracks = tracks
+	e.tracks = cloneTracks(tracks)
 	e.revision = revision
 	if keep {
 		e.rebuildOrder(index)
@@ -458,6 +491,7 @@ func (e *Engine) loadTrack(index int, autoplay bool) bool {
 	e.order.setCurrent(index)
 	e.errText = ""
 	e.sampleRate = 0
+	e.trackGainDB = 0
 	e.playing = false
 	e.loading = true
 	e.control = nil
@@ -500,7 +534,17 @@ func (e *Engine) loadTrack(index int, autoplay bool) bool {
 	}
 	e.ring = ring
 	e.stream = newStreamingTransport(ring, outputRate)
+	e.stream.SetCrossover(e.eqLowHz, e.eqHighHz)
 	e.sampleRate = int(track.inRate)
+	// ReplayGain metadata is read on the engine side (the UI's tagged list lives
+	// on the event loop and the engine owns a clone), and only when enabled so
+	// the default "off" mode adds no I/O.
+	if e.replayGain != "off" {
+		if gain := e.trackGain(library.ReadReplayGain(e.tracks[index].Path)); gain > 0 {
+			e.stream.SetTrackGain(gain)
+			e.trackGainDB = 20 * math.Log10(gain)
+		}
+	}
 	e.stream.SetVolume(e.effectiveVolume())
 	for band, value := range e.eq {
 		e.stream.SetEQ(band, value)
@@ -541,6 +585,38 @@ func (e *Engine) effectiveVolume() float64 {
 	return e.volume
 }
 
+// normalizeReplayGain canonicalizes the configured mode; anything unrecognized
+// disables normalization so a mistyped value is predictable.
+func normalizeReplayGain(mode string) string {
+	switch strings.ToLower(strings.TrimSpace(mode)) {
+	case "track":
+		return "track"
+	case "album":
+		return "album"
+	default:
+		return "off"
+	}
+}
+
+// trackGain returns the linear ReplayGain gain to apply to a track, combining
+// the configured mode and preamp. It is exactly 1 when normalization is off or
+// the track has no usable gain metadata. Album mode prefers the album gain tag
+// and falls back to the track gain.
+func (e *Engine) trackGain(rg library.ReplayGain) float64 {
+	if e.replayGain == "off" {
+		return 1
+	}
+	db, ok := rg.TrackDB, rg.HasTrack
+	if e.replayGain == "album" && rg.HasAlbum {
+		db, ok = rg.AlbumDB, true
+	}
+	if !ok {
+		return 1
+	}
+	// Clamp to a musical range; the soft limiter handles any residual peaks.
+	return math.Pow(10, clamp(db+e.preampDB, -24, 12)/20)
+}
+
 func (e *Engine) applyVolume() {
 	if e.stream == nil {
 		return
@@ -576,7 +652,7 @@ func (e *Engine) publish() {
 		Loading: e.loading, Speed: e.speed, Pitch: e.pitch, Volume: e.volume,
 		Muted: e.muted, Vinyl: e.vinyl, Shuffle: e.shuffle, Repeat: e.repeat,
 		EQ: e.eq, Err: e.errText, Revision: e.revision, Skipped: e.skipped,
-		SampleRate: e.sampleRate,
+		SampleRate: e.sampleRate, ReplayGain: e.replayGain, TrackGainDB: e.trackGainDB,
 	}
 	if len(e.tracks) > 0 {
 		status.Track = e.tracks[e.index]

@@ -667,6 +667,66 @@ func TestDeckShowsPlaybackModes(t *testing.T) {
 	}
 }
 
+func TestDeckShowsReplayGainWhenActive(t *testing.T) {
+	model := NewModel(nil, nil, config.Defaults())
+	model.status = player.Status{Playing: true, Count: 1, Volume: 0.5, ReplayGain: "off"}
+	panel := ansi.Strip(model.deckPanel(80, 24, model.palette()))
+	if strings.Contains(panel, "RG ") {
+		t.Fatalf("deck showed ReplayGain while it was off:\n%s", panel)
+	}
+
+	model.status.ReplayGain = "track"
+	model.status.TrackGainDB = -6.7
+	panel = ansi.Strip(model.deckPanel(80, 24, model.palette()))
+	if !strings.Contains(panel, "RG TRACK") || !strings.Contains(panel, "-6.7dB") {
+		t.Fatalf("deck did not show the active ReplayGain mode/gain:\n%s", panel)
+	}
+}
+
+func TestLibraryBoundaryAndPageNavigation(t *testing.T) {
+	tracks := make([]library.Track, 30)
+	for i := range tracks {
+		tracks[i] = library.Track{
+			Title: "Track " + string(rune('A'+i%26)),
+			Path:  "t" + string(rune('a'+i%26)) + ".flac",
+		}
+	}
+	model := NewModel(tracks, &player.Engine{}, config.Defaults())
+	model.height = 30
+
+	updated, _ := model.Update(tea.KeyMsg{Type: tea.KeyEnd})
+	model = updated.(Model)
+	if model.selected != len(model.visible)-1 {
+		t.Fatalf("End selected %d, want %d", model.selected, len(model.visible)-1)
+	}
+
+	updated, _ = model.Update(tea.KeyMsg{Type: tea.KeyHome})
+	model = updated.(Model)
+	if model.selected != 0 {
+		t.Fatalf("Home selected %d, want 0", model.selected)
+	}
+
+	updated, _ = model.Update(tea.KeyMsg{Type: tea.KeyPgDown})
+	model = updated.(Model)
+	if model.selected != model.libraryPageSize() {
+		t.Fatalf("PgDown selected %d, want %d", model.selected, model.libraryPageSize())
+	}
+
+	updated, _ = model.Update(tea.KeyMsg{Type: tea.KeyPgUp})
+	model = updated.(Model)
+	if model.selected != 0 {
+		t.Fatalf("PgUp selected %d, want 0", model.selected)
+	}
+
+	// Navigation works while the search box is open and is not typed as text.
+	model.searching = true
+	updated, _ = model.Update(tea.KeyMsg{Type: tea.KeyEnd})
+	model = updated.(Model)
+	if !model.searching || model.selected != len(model.visible)-1 {
+		t.Fatalf("search End: searching %t selected %d", model.searching, model.selected)
+	}
+}
+
 func viewText(lines []string) string {
 	return strings.Join(lines, "\n")
 }

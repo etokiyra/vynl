@@ -2,9 +2,11 @@ package library
 
 import (
 	"context"
+	"math"
 	"os"
 	"path/filepath"
 	"runtime"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -17,6 +19,15 @@ type Track struct {
 	Title  string
 	Artist string
 	Album  string
+}
+
+// ReplayGain is the loudness-normalization metadata read from a track's tags,
+// in dB. TrackDB/AlbumDB are the ReplayGain track/album gains.
+type ReplayGain struct {
+	TrackDB  float64
+	AlbumDB  float64
+	HasTrack bool
+	HasAlbum bool
 }
 
 var extensions = map[string]struct{}{
@@ -248,4 +259,103 @@ func readTrack(path string) Track {
 		}
 	}
 	return track
+}
+
+// ReadReplayGain reads only the ReplayGain metadata for path. The engine calls
+// it when it loads a track: the UI's tag stream runs on the event loop and the
+// engine owns an independent track list, so it cannot rely on the UI's copy. A
+// missing, unreadable, or untagged file yields zero-value metadata, which makes
+// normalization a no-op for that track.
+func ReadReplayGain(path string) ReplayGain {
+	file, err := os.Open(path)
+	if err != nil {
+		return ReplayGain{}
+	}
+	defer file.Close()
+	metadata, err := tag.ReadFrom(file)
+	if err != nil {
+		return ReplayGain{}
+	}
+	return replayGainFromRaw(metadata.Raw())
+}
+
+// maxReplayGainDB bounds a tag value so a corrupt or hostile tag cannot blow up
+// the output. Values outside [-24, +24] dB are ignored.
+const maxReplayGainDB = 24
+
+// replayGainFromRaw extracts ReplayGain track/album gains (dB) from tag
+// metadata. Vorbis comments (FLAC/OGG) use lowercase replaygain_* keys; ID3v2
+// stores them in TXXX frames, which dhowden/tag exposes as *tag.Comm values
+// under "TXXX"/"TXXX_n" keys. Missing or malformed values are ignored.
+func replayGainFromRaw(raw map[string]interface{}) ReplayGain {
+	var gain ReplayGain
+	for key, value := range raw {
+		lower := strings.ToLower(key)
+		switch lower {
+		case "replaygain_track_gain":
+			if db, ok := parseGainValue(value); ok {
+				gain.TrackDB, gain.HasTrack = db, true
+			}
+		case "replaygain_album_gain":
+			if db, ok := parseGainValue(value); ok {
+				gain.AlbumDB, gain.HasAlbum = db, true
+			}
+		default:
+			// ID3v2 user-defined text frames.
+			if !strings.HasPrefix(lower, "txxx") {
+				continue
+			}
+			comm, ok := value.(*tag.Comm)
+			if !ok {
+				continue
+			}
+			switch strings.ToLower(strings.TrimSpace(comm.Description)) {
+			case "replaygain_track_gain":
+				if db, ok := parseGainText(comm.Text); ok {
+					gain.TrackDB, gain.HasTrack = db, true
+				}
+			case "replaygain_album_gain":
+				if db, ok := parseGainText(comm.Text); ok {
+					gain.AlbumDB, gain.HasAlbum = db, true
+				}
+			}
+		}
+	}
+	return gain
+}
+
+// parseGainValue accepts the metadata forms ReplayGain uses: Vorbis comments
+// store a string, TXXX stores a *tag.Comm, and some writers store a number.
+func parseGainValue(value interface{}) (float64, bool) {
+	switch v := value.(type) {
+	case string:
+		return parseGainText(v)
+	case *tag.Comm:
+		return parseGainText(v.Text)
+	case float64:
+		return validGainDB(v)
+	case float32:
+		return validGainDB(float64(v))
+	}
+	return 0, false
+}
+
+// parseGainText parses a textual gain such as "-7.23 dB" or "+2.0 dB".
+func parseGainText(text string) (float64, bool) {
+	text = strings.TrimSpace(text)
+	if len(text) >= 2 && strings.EqualFold(text[len(text)-2:], "db") {
+		text = strings.TrimSpace(text[:len(text)-2])
+	}
+	value, err := strconv.ParseFloat(text, 64)
+	if err != nil {
+		return 0, false
+	}
+	return validGainDB(value)
+}
+
+func validGainDB(value float64) (float64, bool) {
+	if math.IsNaN(value) || math.IsInf(value, 0) || math.Abs(value) > maxReplayGainDB {
+		return 0, false
+	}
+	return value, true
 }

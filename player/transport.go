@@ -33,7 +33,10 @@ type transportStreamer struct {
 	speed         float64
 	pitch         float64
 	volume        float64
+	trackGain     float64
 	eq            [3]float64
+	lowHz         float64
+	highHz        float64
 	lowStages     [2]biquad
 	highStages    [2]biquad
 	lowZ          [2][4]float64
@@ -65,7 +68,10 @@ func newStreamingTransport(source *pcmRing, sampleRate int) *transportStreamer {
 		speed:         1,
 		pitch:         1,
 		volume:        1,
+		trackGain:     1,
 		eq:            [3]float64{1, 1, 1},
+		lowHz:         250,
+		highHz:        4000,
 		queue:         make([]sample, 0, grainSize),
 		pending:       make([]sample, 0, overlap),
 		grainBuf:      make([]sample, grainSize),
@@ -111,10 +117,11 @@ func (s *transportStreamer) Stream(out [][2]float64) (int, bool) {
 				low := s.processLow(channel, in[channel])
 				high := s.processHigh(channel, in[channel])
 				mid := in[channel] - low - high
-				value := softLimit((low*s.eq[0] + mid*s.eq[1] + high*s.eq[2]) * s.volume)
+				gain := s.volume * s.trackGain
+				value := softLimit((low*s.eq[0] + mid*s.eq[1] + high*s.eq[2]) * gain)
 				out[written][channel] = value
 				channelSquares[channel] += value * value
-				bass := low * s.eq[0] * s.volume
+				bass := low * s.eq[0] * gain
 				bassSquares += bass * bass
 				if abs(value) > peak {
 					peak = abs(value)
@@ -329,6 +336,16 @@ func (s *transportStreamer) Volume() float64 { return s.volume }
 
 func (s *transportStreamer) SetVolume(value float64) { s.volume = clamp(value, 0, 1) }
 
+// SetTrackGain applies a linear ReplayGain multiplier (1 = no change). It is
+// clamped to [0, 4] (about +12 dB) and a NaN falls back to unity so a corrupt
+// tag cannot silence or blow up the output.
+func (s *transportStreamer) SetTrackGain(value float64) {
+	if math.IsNaN(value) || value < 0 {
+		value = 1
+	}
+	s.trackGain = clamp(value, 0, 4)
+}
+
 func (s *transportStreamer) SetEQ(band int, value float64) {
 	if band >= 0 && band < len(s.eq) {
 		s.eq[band] = clamp(value, 0, 2)
@@ -385,10 +402,24 @@ func (s *transportStreamer) Buffering() bool { return s.buffering }
 // the bands separate steeply while still summing back to the input at unity
 // gain: low + (in-low-high) + high == in exactly.
 func (s *transportStreamer) setFilterRates() {
-	low := butterworthLowPass(250, s.rate)
+	low := butterworthLowPass(s.lowHz, s.rate)
 	s.lowStages = [2]biquad{low, low}
-	high := butterworthHighPass(4000, s.rate)
+	high := butterworthHighPass(s.highHz, s.rate)
 	s.highStages = [2]biquad{high, high}
+}
+
+// SetCrossover changes the 3-way crossover frequencies and rebuilds the filters,
+// clearing their state because the signal path changes. Values that are not
+// positive, are NaN, or do not satisfy low < high are ignored (the defaults
+// stand). It is called before playback starts, so it needs no speaker lock.
+func (s *transportStreamer) SetCrossover(lowHz, highHz float64) {
+	if math.IsNaN(lowHz) || math.IsNaN(highHz) || lowHz <= 0 || highHz <= 0 || lowHz >= highHz {
+		return
+	}
+	s.lowHz, s.highHz = lowHz, highHz
+	s.setFilterRates()
+	s.lowZ = [2][4]float64{}
+	s.highZ = [2][4]float64{}
 }
 
 // processLow runs one sample through the cascaded low-pass sections for channel.

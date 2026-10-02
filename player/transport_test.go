@@ -346,6 +346,75 @@ func TestStreamingTransportStreamsWithoutAllocating(t *testing.T) {
 	producer.Wait()
 }
 
+// TestTransportAppliesTrackGain checks the ReplayGain multiplier scales the
+// output linearly (well below the soft limiter).
+func TestTransportAppliesTrackGain(t *testing.T) {
+	samples := make([]pcmSample, 12000)
+	for i := range samples {
+		value := 0.2 * math.Sin(2*math.Pi*220*float64(i)/12000)
+		samples[i] = pcmSample{float32(value), float32(value)}
+	}
+	unity := newTransportStreamer(samples, 12000)
+	boosted := newTransportStreamer(samples, 12000)
+	boosted.SetTrackGain(2)
+
+	output := make([]sample, 1024)
+	unity.Stream(output)
+	unityRMS := unity.RMS()
+	boosted.Stream(output)
+	if math.Abs(boosted.RMS()-unityRMS*2) > 0.01 {
+		t.Fatalf("track gain did not scale: unity %.4f, boosted %.4f", unityRMS, boosted.RMS())
+	}
+}
+
+func TestSetTrackGainClampsAndRejectsNaN(t *testing.T) {
+	streamer := newTransportStreamer(testTone(8), 12000)
+	streamer.SetTrackGain(math.NaN())
+	if streamer.trackGain != 1 {
+		t.Fatalf("NaN gain = %v, want unity", streamer.trackGain)
+	}
+	streamer.SetTrackGain(-5)
+	if streamer.trackGain != 1 {
+		t.Fatalf("negative gain = %v, want unity", streamer.trackGain)
+	}
+	streamer.SetTrackGain(100)
+	if streamer.trackGain != 4 {
+		t.Fatalf("huge gain = %v, want the 4x clamp", streamer.trackGain)
+	}
+}
+
+// TestSetCrossoverChangesFilterResponse checks that configuring the crossover
+// actually rebuilds the filters: raising the low/mid split lets more low-band
+// energy through at 1 kHz.
+func TestSetCrossoverChangesFilterResponse(t *testing.T) {
+	const rate = 48000
+	defaultSplit := newTransportStreamer(testTone(8), rate)
+	raisedSplit := newTransportStreamer(testTone(8), rate)
+	raisedSplit.SetCrossover(2000, 8000)
+
+	defaultLow := crossoverGain(defaultSplit.processLow, 1000, rate)
+	raisedLow := crossoverGain(raisedSplit.processLow, 1000, rate)
+	if raisedLow <= defaultLow*2 {
+		t.Fatalf("raising the crossover did not pass more low band at 1 kHz: default %.4f, raised %.4f", defaultLow, raisedLow)
+	}
+}
+
+func TestSetCrossoverIgnoresInvalidValues(t *testing.T) {
+	streamer := newTransportStreamer(testTone(8), 12000)
+	streamer.SetCrossover(4000, 2000) // reversed
+	if streamer.lowHz != 250 || streamer.highHz != 4000 {
+		t.Fatalf("reversed crossover changed the filters: %v/%v", streamer.lowHz, streamer.highHz)
+	}
+	streamer.SetCrossover(0, 5000)
+	if streamer.lowHz != 250 || streamer.highHz != 4000 {
+		t.Fatalf("zero crossover changed the filters: %v/%v", streamer.lowHz, streamer.highHz)
+	}
+	streamer.SetCrossover(500, 5000)
+	if streamer.lowHz != 500 || streamer.highHz != 5000 {
+		t.Fatalf("valid crossover not applied: %v/%v", streamer.lowHz, streamer.highHz)
+	}
+}
+
 func testTone(length int) []pcmSample {
 	samples := make([]pcmSample, length)
 	for i := range samples {

@@ -2,6 +2,7 @@ package config
 
 import (
 	"errors"
+	"math"
 	"os"
 	"path/filepath"
 	"strings"
@@ -14,6 +15,24 @@ type Config struct {
 	Theme       Theme       `toml:"theme"`
 	Keybindings Keybindings `toml:"keybindings"`
 	Steps       Steps       `toml:"steps"`
+	Playback    Playback    `toml:"playback"`
+	EQ          EQ          `toml:"eq"`
+}
+
+// EQ configures the 3-band tone control's crossover points. LowHz is the
+// low/mid boundary and HighHz is the mid/high boundary.
+type EQ struct {
+	LowHz  float64 `toml:"low_hz"`
+	HighHz float64 `toml:"high_hz"`
+}
+
+// Playback holds optional audio adjustments. ReplayGain is a loudness
+// normalization mode: "off" (default), "track", or "album" (prefer the album
+// gain tag, falling back to the track gain). PreampDB is applied on top of the
+// chosen gain.
+type Playback struct {
+	ReplayGain string  `toml:"replaygain"`
+	PreampDB   float64 `toml:"preamp_db"`
 }
 
 type Theme struct {
@@ -60,6 +79,10 @@ type Keybindings struct {
 	Search      string `toml:"search"`
 	Rescan      string `toml:"rescan"`
 	NowPlaying  string `toml:"now_playing"`
+	Top         string `toml:"top"`
+	Bottom      string `toml:"bottom"`
+	PageUp      string `toml:"page_up"`
+	PageDown    string `toml:"page_down"`
 	Quit        string `toml:"quit"`
 	EQLow       string `toml:"eq_low"`
 	EQMid       string `toml:"eq_mid"`
@@ -86,9 +109,12 @@ func Defaults() Config {
 			Restart: "0", VolumeDown: "down", VolumeUp: "up", Mute: "m", SpeedDown: "[", SpeedUp: "]",
 			PitchDown: "{", PitchUp: "}", Reset: "r", Vinyl: "v", Shuffle: "z", Repeat: "c",
 			Sort: "o", Search: "/", Rescan: "f5", NowPlaying: "g", Quit: "q",
+			Top: "home", Bottom: "end", PageUp: "pgup", PageDown: "pgdown",
 			EQLow: "1", EQMid: "2", EQHigh: "3", EQGainDown: "-", EQGainUp: "+",
 		},
-		Steps: Steps{Seek: 5, Volume: 0.05, Tempo: 0.05, Pitch: 1, EQ: 0.1},
+		Steps:    Steps{Seek: 5, Volume: 0.05, Tempo: 0.05, Pitch: 1, EQ: 0.1},
+		Playback: Playback{ReplayGain: "off"},
+		EQ:       EQ{LowHz: 250, HighHz: 4000},
 	}
 }
 
@@ -117,7 +143,47 @@ func Load(path string) (Config, error) {
 		cfg.MusicDir = Defaults().MusicDir
 	}
 	cfg.Steps = cfg.Steps.normalized()
+	cfg.Playback = cfg.Playback.normalized()
+	cfg.EQ = cfg.EQ.normalized()
 	return cfg, nil
+}
+
+// normalized clamps the crossover points into the audible band and keeps a
+// sensible gap between them. Anything invalid (non-positive, NaN, reversed, or
+// too close together) falls back to the defaults.
+func (e EQ) normalized() EQ {
+	defaults := Defaults().EQ
+	if math.IsNaN(e.LowHz) || e.LowHz <= 0 {
+		e.LowHz = defaults.LowHz
+	}
+	if math.IsNaN(e.HighHz) || e.HighHz <= 0 {
+		e.HighHz = defaults.HighHz
+	}
+	e.LowHz = math.Max(20, math.Min(4000, e.LowHz))
+	e.HighHz = math.Max(200, math.Min(20000, e.HighHz))
+	if e.LowHz*2 > e.HighHz {
+		return defaults
+	}
+	return e
+}
+
+// normalized canonicalizes the ReplayGain mode and clamps the preamp, so a
+// mistyped mode silently disables normalization and an extreme preamp cannot
+// dominate the output.
+func (p Playback) normalized() Playback {
+	switch strings.ToLower(strings.TrimSpace(p.ReplayGain)) {
+	case "track":
+		p.ReplayGain = "track"
+	case "album":
+		p.ReplayGain = "album"
+	default:
+		p.ReplayGain = "off"
+	}
+	if math.IsNaN(p.PreampDB) {
+		p.PreampDB = 0
+	}
+	p.PreampDB = math.Max(-12, math.Min(12, p.PreampDB))
+	return p
 }
 
 // normalized replaces a non-positive (or NaN) step with its default, so a

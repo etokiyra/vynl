@@ -1,6 +1,7 @@
 package config
 
 import (
+	"math"
 	"os"
 	"path/filepath"
 	"testing"
@@ -34,6 +35,7 @@ func TestDefaultsBindPlaybackControlsDistinctly(t *testing.T) {
 		"pitch_up": keys.PitchUp, "reset": keys.Reset, "vinyl": keys.Vinyl, "shuffle": keys.Shuffle,
 		"repeat": keys.Repeat, "sort": keys.Sort, "search": keys.Search, "quit": keys.Quit,
 		"rescan": keys.Rescan, "now_playing": keys.NowPlaying,
+		"top": keys.Top, "bottom": keys.Bottom, "page_up": keys.PageUp, "page_down": keys.PageDown,
 		"eq_low": keys.EQLow, "eq_mid": keys.EQMid, "eq_high": keys.EQHigh,
 		"eq_gain_down": keys.EQGainDown, "eq_gain_up": keys.EQGainUp,
 	}
@@ -134,6 +136,99 @@ func TestLoadReadsEQAndThemeKeys(t *testing.T) {
 	}
 	if cfg.Keybindings.EQMid != "2" || cfg.Keybindings.EQGainDown != "-" {
 		t.Fatalf("omitted EQ keys lost defaults: %+v", cfg.Keybindings)
+	}
+}
+
+func TestLoadPlaybackReplayGain(t *testing.T) {
+	cfg, err := Load(filepath.Join(t.TempDir(), "missing.toml"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Playback.ReplayGain != "off" || cfg.Playback.PreampDB != 0 {
+		t.Fatalf("default playback = %+v, want off/0", cfg.Playback)
+	}
+
+	path := filepath.Join(t.TempDir(), "config.toml")
+	if err := os.WriteFile(path, []byte("[playback]\nreplaygain = \"album\"\npreamp_db = 3.5\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err = Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Playback.ReplayGain != "album" || cfg.Playback.PreampDB != 3.5 {
+		t.Fatalf("loaded playback = %+v, want album/3.5", cfg.Playback)
+	}
+}
+
+func TestPlaybackNormalization(t *testing.T) {
+	cases := []struct {
+		mode       string
+		preamp     float64
+		wantMode   string
+		wantPreamp float64
+	}{
+		{"TRACK", 0, "track", 0},
+		{" Album ", 0, "album", 0},
+		{"bogus", 0, "off", 0},
+		{"", 0, "off", 0},
+		{"track", 99, "track", 12},
+		{"track", -99, "track", -12},
+	}
+	for _, test := range cases {
+		got := Playback{ReplayGain: test.mode, PreampDB: test.preamp}.normalized()
+		if got.ReplayGain != test.wantMode || got.PreampDB != test.wantPreamp {
+			t.Errorf("normalized(%q, %v) = %+v, want %s/%v", test.mode, test.preamp, got, test.wantMode, test.wantPreamp)
+		}
+	}
+	if got := (Playback{ReplayGain: "track", PreampDB: math.NaN()}).normalized(); got.PreampDB != 0 {
+		t.Fatalf("NaN preamp = %v, want 0", got.PreampDB)
+	}
+}
+
+func TestLoadEQSettings(t *testing.T) {
+	cfg, err := Load(filepath.Join(t.TempDir(), "missing.toml"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.EQ != (EQ{LowHz: 250, HighHz: 4000}) {
+		t.Fatalf("default EQ = %+v, want 250/4000", cfg.EQ)
+	}
+
+	path := filepath.Join(t.TempDir(), "config.toml")
+	if err := os.WriteFile(path, []byte("[eq]\nlow_hz = 300\nhigh_hz = 3500\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err = Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.EQ.LowHz != 300 || cfg.EQ.HighHz != 3500 {
+		t.Fatalf("loaded EQ = %+v, want 300/3500", cfg.EQ)
+	}
+}
+
+func TestEQNormalization(t *testing.T) {
+	cases := []struct {
+		low, high         float64
+		wantLow, wantHigh float64
+	}{
+		{300, 3500, 300, 3500},
+		{0, 0, 250, 4000},
+		{-5, 2000, 250, 2000},   // invalid low falls back, high honored
+		{1000, -1, 1000, 4000},  // invalid high falls back
+		{3000, 2000, 250, 4000}, // reversed/too close -> defaults
+		{10, 4000, 20, 4000},    // low clamped up
+		{1000, 30000, 1000, 20000},
+	}
+	for _, test := range cases {
+		got := EQ{LowHz: test.low, HighHz: test.high}.normalized()
+		if got.LowHz != test.wantLow || got.HighHz != test.wantHigh {
+			t.Errorf("normalized(%v, %v) = %+v, want %v/%v", test.low, test.high, got, test.wantLow, test.wantHigh)
+		}
+	}
+	if got := (EQ{LowHz: math.NaN(), HighHz: math.NaN()}).normalized(); got != (EQ{LowHz: 250, HighHz: 4000}) {
+		t.Fatalf("NaN crossover = %+v, want defaults", got)
 	}
 }
 
