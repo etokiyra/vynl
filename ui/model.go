@@ -25,6 +25,7 @@ import (
 
 type tickMsg time.Time
 type statusMsg player.Status
+type trackDetailsMsg trackDetails
 
 type trackDetails struct {
 	path       string
@@ -103,14 +104,22 @@ func (m Model) Update(message tea.Msg) (tea.Model, tea.Cmd) {
 			m.channelTarget = [2]float64{}
 			m.bassTarget = 0
 		}
-		if m.loaded.path != m.status.Track.Path {
-			m.loaded = readTrackDetails(m.status.Track.Path)
-		}
 		commands := []tea.Cmd{waitForStatus(m.engine.Updates())}
+		if m.loaded.path != m.status.Track.Path {
+			// Reserve the path so repeated status updates do not queue duplicate
+			// reads, and load the header off the update loop: decoding a file on
+			// a slow or network-mounted library must not stall rendering.
+			m.loaded = trackDetails{path: m.status.Track.Path}
+			commands = append(commands, loadTrackDetails(m.status.Track.Path))
+		}
 		if !wasPlaying && m.status.Playing {
 			commands = append(commands, tick())
 		}
 		return m, tea.Batch(commands...)
+	case trackDetailsMsg:
+		if details := trackDetails(msg); details.path == m.status.Track.Path {
+			m.loaded = details
+		}
 	case tea.KeyMsg:
 		return m.updateKey(msg)
 	}
@@ -132,6 +141,12 @@ func (m Model) updateKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			}
 			m.searching = false
 			m.deckFocused = true
+			return m, nil
+		case "up":
+			m.moveSelection(-1)
+			return m, nil
+		case "down":
+			m.moveSelection(1)
 			return m, nil
 		case "backspace":
 			if len(m.search) > 0 {
@@ -171,6 +186,8 @@ func (m Model) updateKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		m.engine.Send(player.Command{Action: player.Seek, Value: -5})
 	case key == keys.SeekForward:
 		m.engine.Send(player.Command{Action: player.Seek, Value: 5})
+	case key == keys.Restart:
+		m.engine.Send(player.Command{Action: player.Restart})
 	case key == keys.VolumeUp:
 		if m.deckFocused {
 			m.engine.Send(player.Command{Action: player.Volume, Value: 0.05})
@@ -183,6 +200,8 @@ func (m Model) updateKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		} else {
 			m.moveSelection(1)
 		}
+	case key == keys.Mute:
+		m.engine.Send(player.Command{Action: player.Mute})
 	case key == keys.SpeedDown:
 		m.engine.Send(player.Command{Action: player.Speed, Value: -0.05})
 	case key == keys.SpeedUp:
@@ -193,8 +212,12 @@ func (m Model) updateKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		m.engine.Send(player.Command{Action: player.Pitch, Value: 1})
 	case key == keys.Reset:
 		m.engine.Send(player.Command{Action: player.Reset})
-	case key == "v":
+	case key == keys.Vinyl:
 		m.engine.Send(player.Command{Action: player.Vinyl})
+	case key == keys.Shuffle:
+		m.engine.Send(player.Command{Action: player.Shuffle})
+	case key == keys.Repeat:
+		m.engine.Send(player.Command{Action: player.Repeat})
 	case key == "1", key == "2", key == "3":
 		m.eqBand = int(key[0] - '1')
 	case key == "-":
@@ -262,16 +285,58 @@ func (m Model) View() string {
 	header := palette.cyan.Bold(true).Render("VYNL") + palette.muted.Render("  /  ANALOG AUDIO CONSOLE") + palette.green.Render("  "+live+" LIVE")
 	header = fixedBlock(header, innerWidth, headerHeight, palette.background)
 	eq := m.eqPanel(innerWidth, eqHeight, palette)
-	help := palette.muted.Render("SPACE play  N/P track  arrows seek  [ ] speed  { } pitch  R reset  V vinyl  TAB focus  Q quit")
-	if m.searching {
-		help = palette.magenta.Render("SEARCH  ") + palette.text.Render(m.search+"_") + palette.muted.Render("   ENTER select   ESC cancel")
-	}
+	help := m.helpLine(palette)
 	help = fixedBlock(help, innerWidth, footerHeight, palette.background)
 	inner := lipgloss.JoinVertical(lipgloss.Left, header, body, eq, help)
 	inner = fixedBlock(inner, innerWidth, innerHeight, palette.background)
 	return lipgloss.NewStyle().Foreground(palette.foregroundColor).
 		Width(innerWidth).Height(innerHeight).Border(lipgloss.RoundedBorder()).BorderForeground(palette.cyan.GetForeground()).
 		Render(inner)
+}
+
+func (m Model) helpLine(p palette) string {
+	if m.searching {
+		return p.magenta.Render("SEARCH  ") + p.text.Render(m.search+"_") + p.muted.Render("   ↑↓ pick   ENTER load   ESC cancel")
+	}
+	keys := m.config.Keybindings
+	if m.deckFocused {
+		parts := []string{
+			keyLabel(keys.Toggle) + " play",
+			keyLabel(keys.Next) + "/" + keyLabel(keys.Prev) + " track",
+			keyLabel(keys.SeekBack) + "/" + keyLabel(keys.SeekForward) + " seek",
+			keyLabel(keys.VolumeDown) + "/" + keyLabel(keys.VolumeUp) + " vol",
+			keyLabel(keys.Vinyl) + " vinyl",
+			keyLabel(keys.Mute) + " mute",
+			keyLabel(keys.Shuffle) + " shuffle",
+			keyLabel(keys.Repeat) + " repeat",
+			"TAB library",
+			keyLabel(keys.Quit) + " quit",
+		}
+		return p.muted.Render(strings.Join(parts, "  "))
+	}
+	return p.muted.Render("↑/↓ browse   ENTER load   " + keyLabel(keys.Search) +
+		" find   " + keyLabel(keys.Toggle) + " play   " + keyLabel(keys.Next) + "/" + keyLabel(keys.Prev) +
+		" track   TAB deck   " + keyLabel(keys.Quit) + " quit")
+}
+
+// keyLabel renders a configured key in a form that reads well in the help bar.
+func keyLabel(key string) string {
+	switch key {
+	case " ":
+		return "SPACE"
+	case "left":
+		return "←"
+	case "right":
+		return "→"
+	case "up":
+		return "↑"
+	case "down":
+		return "↓"
+	}
+	if len([]rune(key)) == 1 {
+		return strings.ToUpper(key)
+	}
+	return key
 }
 
 func (m Model) deckPanel(width, height int, p palette) string {
@@ -325,15 +390,21 @@ func (m Model) deckPanel(width, height int, p palette) string {
 			top[i] = art[i] + "  " + info[i]
 		}
 	}
+	volumeBar := fmt.Sprintf("VOL %s %02.0f%%", slider(m.status.Volume, max(3, min(10, inner-15))), m.status.Volume*100)
+	shortVolume := fmt.Sprintf("VOL %02.0f%%", m.status.Volume*100)
+	if m.status.Muted {
+		volumeBar = "VOL MUTED"
+		shortVolume = "VOL MUTED"
+	}
 	controls := []string{
 		fmt.Sprintf("SPD %s %.2fx", slider((m.status.Speed-0.5)/1.5, max(3, min(10, inner-16))), m.status.Speed),
 		fmt.Sprintf("PITCH %s %+.0fst", slider((m.status.Pitch+12)/24, max(3, min(10, inner-18))), m.status.Pitch),
-		fmt.Sprintf("VOL %s %02.0f%%", slider(m.status.Volume, max(3, min(10, inner-15))), m.status.Volume*100),
+		volumeBar,
 	}
 	vu := vuInline(m.visualChannels(), m.metersActive(), p)
 	controlText := strings.Join(controls, "   ") + "   " + vu
 	if lipgloss.Width(controlText) > inner {
-		controlText = strings.Join([]string{fmt.Sprintf("SPD %.2fx", m.status.Speed), fmt.Sprintf("PITCH %+.0fst", m.status.Pitch), fmt.Sprintf("VOL %02.0f%%", m.status.Volume*100), vu}, "   ")
+		controlText = strings.Join([]string{fmt.Sprintf("SPD %.2fx", m.status.Speed), fmt.Sprintf("PITCH %+.0fst", m.status.Pitch), shortVolume, vu}, "   ")
 	}
 	contentHeight := max(0, height-3)
 	baseLines := append([]string(nil), top...)
@@ -342,7 +413,14 @@ func (m Model) deckPanel(width, height int, p palette) string {
 		icons := []string{">>>", "> >", ">>>", " > "}
 		marker = p.green.Bold(true).Render("[ " + icons[(m.frame/2)%len(icons)] + " PLAYING ]")
 	}
-	baseLines = append(baseLines, marker+"  "+p.muted.Render("VINYL "+boolLabel(m.status.Vinyl)))
+	modes := []string{"VINYL " + boolLabel(m.status.Vinyl)}
+	if m.status.Shuffle {
+		modes = append(modes, "SHUFFLE")
+	}
+	if m.status.Repeat != player.RepeatOff {
+		modes = append(modes, "REPEAT "+strings.ToUpper(string(m.status.Repeat)))
+	}
+	baseLines = append(baseLines, marker+"  "+p.muted.Render(strings.Join(modes, "  ")))
 	baseLines = append(baseLines, p.text.Render(truncate(controlText, inner, "~")))
 	if m.status.Err != "" {
 		baseLines = append(baseLines, p.error.Render(truncate(m.status.Err, inner, "…")))
@@ -376,14 +454,19 @@ func (m Model) libraryPanel(width, height int, p palette) string {
 		start = max(0, min(m.selected-maxTracks/2, len(m.visible)-maxTracks))
 		end = start + maxTracks
 	}
-	lines := []string{p.muted.Render(fmt.Sprintf("%d TRACKS  /  %d MATCH", len(m.tracks), len(m.visible)))}
+	header := fmt.Sprintf("%d TRACKS  /  %d MATCH", len(m.tracks), len(m.visible))
+	if query := strings.TrimSpace(m.search); query != "" {
+		header += "  FILTER: " + query
+	}
+	lines := []string{p.muted.Render(header)}
 	if m.searching {
 		lines = append(lines, p.magenta.Render("FIND: "+m.search+"_"))
 	} else {
 		lines = append(lines, p.muted.Render("↑ ↓ browse   ENTER load   / find"))
 	}
 	for index := start; index < end; index++ {
-		track := m.tracks[m.visible[index]]
+		trackIndex := m.visible[index]
+		track := m.tracks[trackIndex]
 		name := track.Title
 		artist := track.Artist
 		if artist == "" {
@@ -392,13 +475,18 @@ func (m Model) libraryPanel(width, height int, p palette) string {
 		if artist == "" {
 			artist = filepathBase(track.Path)
 		}
-		line := truncate(name, inner, "…")
-		if index == m.selected {
-			line = p.cyan.Bold(true).Render("› " + truncate(name, inner-2, "…"))
-		} else {
-			line = p.text.Render("  " + line)
+		marker := "  "
+		if m.status.Count > 0 && trackIndex == m.status.Index {
+			marker = "▶ "
 		}
-		lines = append(lines, line)
+		switch {
+		case index == m.selected:
+			lines = append(lines, p.cyan.Bold(true).Render(marker+truncate(name, inner-2, "…")))
+		case marker == "▶ ":
+			lines = append(lines, p.green.Render(marker+truncate(name, inner-2, "…")))
+		default:
+			lines = append(lines, p.text.Render(marker+truncate(name, inner-2, "…")))
+		}
 		if inner > 28 {
 			lines = append(lines, p.muted.Render("  "+truncate(artist, inner-2, "…")))
 		}
@@ -856,12 +944,21 @@ func clock(seconds float64) string {
 		seconds = 0
 	}
 	duration := time.Duration(seconds * float64(time.Second))
-	minutes := int(duration / time.Minute)
-	return fmt.Sprintf("%02d:%02d", minutes, int(duration/time.Second)%60)
+	hours := int(duration / time.Hour)
+	minutes := int(duration/time.Minute) % 60
+	secondsPart := int(duration/time.Second) % 60
+	if hours > 0 {
+		return fmt.Sprintf("%d:%02d:%02d", hours, minutes, secondsPart)
+	}
+	return fmt.Sprintf("%02d:%02d", minutes, secondsPart)
 }
 
 func filepathBase(path string) string {
 	return filepath.Base(path)
+}
+
+func loadTrackDetails(path string) tea.Cmd {
+	return func() tea.Msg { return trackDetailsMsg(readTrackDetails(path)) }
 }
 
 func readTrackDetails(path string) trackDetails {

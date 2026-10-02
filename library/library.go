@@ -23,7 +23,14 @@ func Scan(root string) ([]Track, error) {
 	var tracks []Track
 	err := filepath.WalkDir(root, func(path string, entry os.DirEntry, walkErr error) error {
 		if walkErr != nil {
-			return walkErr
+			// One unreadable folder should not make the whole library
+			// unscannable: skip the entry and keep walking. A failure to read
+			// the root itself is still fatal so a bad music directory is
+			// reported to the user.
+			if path == root {
+				return walkErr
+			}
+			return nil
 		}
 		if entry.IsDir() {
 			return nil

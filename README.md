@@ -42,14 +42,16 @@ transparent terminals like kitty, foot, or Alacritty.
   stereo L/R VU meters and level readouts are directly signal-derived
 - 🎛️ **3-band EQ** — low / mid / high gain control, driven by lightweight
   single-pole filters suited for real-time playback
+- 🔀 **Shuffle & repeat** — shuffle the play order, cycle repeat off / all / one,
+  and mute or restart the current track from the keyboard
 - 📚 **Local library browser** — scans a folder for supported formats, reads
   tags, fuzzy search, instant load
 - 🔊 **Stereo L/R level meters** and live track metadata (format, bitrate,
   sample rate, file size)
 - 🖤 **Terminal-native transparency** — no hardcoded backgrounds; your
   terminal's own theme and opacity show through
-- ⚙️ **Fully configurable** — theme colors and keybindings via a TOML config
-  file
+- ⚙️ **Configurable** — theme colors, music directory, and keybindings via a
+  TOML config file
 
 ---
 
@@ -97,14 +99,19 @@ vynl -config /path/to/config.toml
 | `{` / `}`     | Decrease / increase pitch        |
 | `R`           | Reset transport to defaults      |
 | `V`           | Toggle vinyl mode                |
+| `0`           | Restart current track from start |
+| `M`           | Mute / unmute                    |
+| `Z`           | Toggle shuffle                   |
+| `C`           | Cycle repeat: off → all → one    |
 | `1` / `2` / `3` | Select EQ band (low/mid/high)  |
 | `+` / `-`     | Adjust gain on selected EQ band  |
 | `Tab`         | Switch focus: library ↔ deck     |
 | `/`           | Search library                   |
 | `Q`           | Quit                              |
 
-> Arrow keys browse the library list while it has focus; on the deck, the
-> same keys control volume and seeking instead.
+> `↑` / `↓` browse the library when it has focus and change volume on the deck;
+> `←` / `→` always seek. While the search box is open, `↑` / `↓` move through
+> the matching tracks.
 
 ---
 
@@ -130,13 +137,18 @@ next          = "n"
 previous      = "p"
 seek_back     = "left"
 seek_forward  = "right"
+restart       = "0"
 volume_down   = "down"
 volume_up     = "up"
+mute          = "m"
 speed_down    = "["
 speed_up      = "]"
 pitch_down    = "{"
 pitch_up      = "}"
 reset         = "r"
+vinyl         = "v"
+shuffle       = "z"
+repeat        = "c"
 search        = "/"
 quit          = "q"
 ```
@@ -171,6 +183,10 @@ a bug.
 
 - Very large libraries (hundreds+ of tracks) may cause a noticeable pause on
   startup during tag scanning
+- Unreadable folders inside the music directory are skipped during the scan;
+  the rest of the library still loads
+- The full decoded audio for the current track is kept in memory, so very long
+  files (multi-hour mixes) use a significant amount of RAM
 - Extreme speed/pitch settings can introduce minor artifacts on
   percussion-heavy material, due to the grain-based resampling approach
 

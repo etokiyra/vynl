@@ -284,6 +284,117 @@ func TestProgressHeadPulsesOnlyWhilePlaying(t *testing.T) {
 	}
 }
 
+func TestSearchArrowKeysMoveSelection(t *testing.T) {
+	tracks := []library.Track{
+		{Title: "Alpha", Path: "a.flac"},
+		{Title: "Gamma", Path: "c.flac"},
+		{Title: "Zulu", Path: "z.flac"},
+	}
+	model := NewModel(tracks, &player.Engine{}, config.Defaults())
+	model.search = "a"
+	model.refreshVisible()
+	model.searching = true
+	if len(model.visible) < 2 {
+		t.Fatalf("expected multiple matches, got %v", model.visible)
+	}
+
+	updated, _ := model.Update(tea.KeyMsg{Type: tea.KeyDown})
+	model = updated.(Model)
+	if model.selected != 1 {
+		t.Fatalf("down in search moved selection to %d, want 1", model.selected)
+	}
+	updated, _ = model.Update(tea.KeyMsg{Type: tea.KeyUp})
+	model = updated.(Model)
+	if model.selected != 0 {
+		t.Fatalf("up in search moved selection to %d, want 0", model.selected)
+	}
+}
+
+func TestHelpLineReflectsFocusAndConfiguredKeys(t *testing.T) {
+	cfg := config.Defaults()
+	cfg.Keybindings.Shuffle = "j"
+	model := NewModel(nil, &player.Engine{}, cfg)
+
+	model.deckFocused = true
+	deck := ansi.Strip(model.helpLine(model.palette()))
+	for _, expected := range []string{"J shuffle", "vinyl", "mute", "repeat"} {
+		if !strings.Contains(deck, expected) {
+			t.Errorf("deck help missing %q: %q", expected, deck)
+		}
+	}
+
+	model.deckFocused = false
+	library := ansi.Strip(model.helpLine(model.palette()))
+	for _, expected := range []string{"browse", "find", "TAB deck"} {
+		if !strings.Contains(library, expected) {
+			t.Errorf("library help missing %q: %q", expected, library)
+		}
+	}
+
+	model.searching = true
+	model.search = "jazz"
+	search := ansi.Strip(model.helpLine(model.palette()))
+	if !strings.Contains(search, "jazz") || !strings.Contains(search, "pick") {
+		t.Errorf("search help = %q, want query and navigation hint", search)
+	}
+}
+
+func TestKeyLabel(t *testing.T) {
+	cases := map[string]string{
+		" ": "SPACE", "left": "←", "right": "→", "up": "↑", "down": "↓",
+		"q": "Q", "esc": "esc", "home": "home",
+	}
+	for key, want := range cases {
+		if got := keyLabel(key); got != want {
+			t.Errorf("keyLabel(%q) = %q, want %q", key, got, want)
+		}
+	}
+}
+
+func TestLibraryMarksPlayingTrackAndActiveFilter(t *testing.T) {
+	tracks := []library.Track{
+		{Title: "First", Artist: "One", Path: "/music/1.flac"},
+		{Title: "Second", Artist: "Two", Path: "/music/2.flac"},
+	}
+	model := NewModel(tracks, nil, config.Defaults())
+	model.status = player.Status{Track: tracks[1], Index: 1, Count: 2}
+	panel := ansi.Strip(model.libraryPanel(50, 30, model.palette()))
+	if !strings.Contains(panel, "▶ Second") {
+		t.Fatalf("library did not mark the playing track:\n%s", panel)
+	}
+	if strings.Contains(panel, "▶ First") {
+		t.Fatalf("library marked a non-playing track:\n%s", panel)
+	}
+
+	model.search = "second"
+	model.refreshVisible()
+	panel = ansi.Strip(model.libraryPanel(50, 30, model.palette()))
+	if !strings.Contains(panel, "FILTER: second") {
+		t.Fatalf("library did not show the active filter:\n%s", panel)
+	}
+}
+
+func TestDeckShowsPlaybackModes(t *testing.T) {
+	model := NewModel(nil, nil, config.Defaults())
+	model.status = player.Status{Playing: true, Count: 1, Volume: 0.5, Shuffle: true, Repeat: player.RepeatOne}
+	panel := ansi.Strip(model.deckPanel(80, 24, model.palette()))
+	if !strings.Contains(panel, "SHUFFLE") || !strings.Contains(panel, "REPEAT ONE") {
+		t.Fatalf("deck did not show shuffle/repeat state:\n%s", panel)
+	}
+
+	model.status.Repeat = player.RepeatOff
+	panel = ansi.Strip(model.deckPanel(80, 24, model.palette()))
+	if strings.Contains(panel, "REPEAT") {
+		t.Fatalf("deck showed a repeat mode while repeat was off:\n%s", panel)
+	}
+
+	model.status.Muted = true
+	panel = ansi.Strip(model.deckPanel(80, 24, model.palette()))
+	if !strings.Contains(panel, "MUTED") {
+		t.Fatalf("deck did not show the muted state:\n%s", panel)
+	}
+}
+
 func viewText(lines []string) string {
 	return strings.Join(lines, "\n")
 }
@@ -322,8 +433,73 @@ func TestPlaybackPositionFreezesWhileBuffering(t *testing.T) {
 }
 
 func TestReadTrackDetailsUsesAudioHeaderAndFileStats(t *testing.T) {
-	path := filepath.Join(t.TempDir(), "sample.wav")
-	data := make([]byte, 44+4800*2)
+	path := writeTestWAV(t, 48000, 4800)
+	details := readTrackDetails(path)
+	if details.format != "WAV" || details.sampleRate != 48000 || details.bytes != int64(44+4800*2) {
+		t.Fatalf("track details = %+v", details)
+	}
+	if got := strings.Join(details.displayLines(0.1, NewModel(nil, nil, config.Defaults()).palette()), " "); !strings.Contains(got, "48.0 kHz") || !strings.Contains(got, "AVG") {
+		t.Fatalf("metadata display = %q", got)
+	}
+}
+
+func TestClockFormatsLongDurations(t *testing.T) {
+	cases := []struct {
+		seconds float64
+		want    string
+	}{
+		{-5, "00:00"},
+		{0, "00:00"},
+		{59, "00:59"},
+		{60, "01:00"},
+		{3599, "59:59"},
+		{3600, "1:00:00"},
+		{3661, "1:01:01"},
+		{7325, "2:02:05"},
+	}
+	for _, test := range cases {
+		if got := clock(test.seconds); got != test.want {
+			t.Errorf("clock(%.0f) = %q, want %q", test.seconds, got, test.want)
+		}
+	}
+}
+
+func TestTrackDetailsLoadAsynchronously(t *testing.T) {
+	path := writeTestWAV(t, 48000, 4800)
+	model := NewModel([]library.Track{{Path: path}}, &player.Engine{}, config.Defaults())
+	model.status = player.Status{Track: library.Track{Path: path}}
+
+	updated, command := model.Update(statusMsg(model.status))
+	if command == nil {
+		t.Fatal("status message did not schedule asynchronous detail loading")
+	}
+	model = updated.(Model)
+	if model.loaded.path != path {
+		t.Fatalf("reserved details path = %q, want %q", model.loaded.path, path)
+	}
+	if model.loaded.sampleRate != 0 {
+		t.Fatalf("details were read synchronously: sample rate %d", model.loaded.sampleRate)
+	}
+
+	message := loadTrackDetails(path)()
+	if _, ok := message.(trackDetailsMsg); !ok {
+		t.Fatalf("detail command returned %T, want trackDetailsMsg", message)
+	}
+	updated, _ = model.Update(message)
+	if got := updated.(Model).loaded.sampleRate; got != 48000 {
+		t.Fatalf("loaded sample rate = %d, want 48000", got)
+	}
+
+	model = updated.(Model)
+	updated, _ = model.Update(trackDetailsMsg(trackDetails{path: "other.wav", sampleRate: 44100}))
+	if got := updated.(Model).loaded.sampleRate; got != 48000 {
+		t.Fatalf("stale detail message was applied: sample rate %d", got)
+	}
+}
+
+func writeTestWAV(t *testing.T, sampleRate, frames int) string {
+	t.Helper()
+	data := make([]byte, 44+frames*2)
 	copy(data[0:4], "RIFF")
 	binary.LittleEndian.PutUint32(data[4:8], uint32(len(data)-8))
 	copy(data[8:12], "WAVE")
@@ -331,22 +507,17 @@ func TestReadTrackDetailsUsesAudioHeaderAndFileStats(t *testing.T) {
 	binary.LittleEndian.PutUint32(data[16:20], 16)
 	binary.LittleEndian.PutUint16(data[20:22], 1)
 	binary.LittleEndian.PutUint16(data[22:24], 1)
-	binary.LittleEndian.PutUint32(data[24:28], 48000)
-	binary.LittleEndian.PutUint32(data[28:32], 96000)
+	binary.LittleEndian.PutUint32(data[24:28], uint32(sampleRate))
+	binary.LittleEndian.PutUint32(data[28:32], uint32(sampleRate*2))
 	binary.LittleEndian.PutUint16(data[32:34], 2)
 	binary.LittleEndian.PutUint16(data[34:36], 16)
 	copy(data[36:40], "data")
 	binary.LittleEndian.PutUint32(data[40:44], uint32(len(data)-44))
+	path := filepath.Join(t.TempDir(), "sample.wav")
 	if err := os.WriteFile(path, data, 0o600); err != nil {
 		t.Fatal(err)
 	}
-	details := readTrackDetails(path)
-	if details.format != "WAV" || details.sampleRate != 48000 || details.bytes != int64(len(data)) {
-		t.Fatalf("track details = %+v", details)
-	}
-	if got := strings.Join(details.displayLines(0.1, NewModel(nil, nil, config.Defaults()).palette()), " "); !strings.Contains(got, "48.0 kHz") || !strings.Contains(got, "AVG") {
-		t.Fatalf("metadata display = %q", got)
-	}
+	return path
 }
 
 func TestLibraryUsesMetadataAndStereoMeterForRemainingSpace(t *testing.T) {

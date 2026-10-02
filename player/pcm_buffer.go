@@ -29,32 +29,19 @@ func (b *pcmBuffer) append(samples []pcmSample) bool {
 	if len(samples) == 0 {
 		return true
 	}
-	b.mu.RLock()
-	current := b.samples
-	done := b.done
-	b.mu.RUnlock()
-	if done {
-		return false
-	}
-
-	if cap(current)-len(current) < len(samples) {
-		capacity := maxInt(len(current)+len(samples), maxInt(4096, cap(current)*2))
-		grown := make([]pcmSample, len(current), capacity)
-		copy(grown, current)
-		grown = append(grown, samples...)
-		b.mu.Lock()
-		defer b.mu.Unlock()
-		if b.done {
-			return false
-		}
-		b.samples = grown
-		return true
-	}
-
+	// The capacity check and the slice update must happen under the same lock:
+	// if they are split, two writers can both read the same slice header and
+	// the later one overwrites samples appended by the earlier one.
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	if b.done {
 		return false
+	}
+	if cap(b.samples)-len(b.samples) < len(samples) {
+		capacity := maxInt(len(b.samples)+len(samples), maxInt(4096, cap(b.samples)*2))
+		grown := make([]pcmSample, len(b.samples), capacity)
+		copy(grown, b.samples)
+		b.samples = grown
 	}
 	b.samples = append(b.samples, samples...)
 	return true

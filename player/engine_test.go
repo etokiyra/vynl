@@ -74,6 +74,31 @@ func TestDecoderWorkerIsJoinedBeforeTrackReplacement(t *testing.T) {
 	}
 }
 
+func TestNewEngineRejectsEmptyLibrary(t *testing.T) {
+	if _, err := NewEngine(nil); err == nil {
+		t.Fatal("NewEngine accepted an empty library")
+	}
+}
+
+func TestEffectiveVolumeRespectsMute(t *testing.T) {
+	engine := &Engine{volume: 0.8}
+	if got := engine.effectiveVolume(); got != 0.8 {
+		t.Fatalf("effective volume = %.2f, want 0.8", got)
+	}
+	engine.muted = true
+	if got := engine.effectiveVolume(); got != 0 {
+		t.Fatalf("muted effective volume = %.2f, want 0", got)
+	}
+	engine.volume = 0.4
+	if got := engine.effectiveVolume(); got != 0 {
+		t.Fatalf("muted effective volume changed with volume = %.2f, want 0", got)
+	}
+	engine.muted = false
+	if got := engine.effectiveVolume(); got != 0.4 {
+		t.Fatalf("unmuted effective volume = %.2f, want 0.4", got)
+	}
+}
+
 func writeTestWAV(t *testing.T, seconds, sampleRate int) string {
 	t.Helper()
 	dataSize := seconds * sampleRate * 2 * 2

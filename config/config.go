@@ -29,13 +29,18 @@ type Keybindings struct {
 	Prev        string `toml:"previous"`
 	SeekBack    string `toml:"seek_back"`
 	SeekForward string `toml:"seek_forward"`
+	Restart     string `toml:"restart"`
 	VolumeDown  string `toml:"volume_down"`
 	VolumeUp    string `toml:"volume_up"`
+	Mute        string `toml:"mute"`
 	SpeedDown   string `toml:"speed_down"`
 	SpeedUp     string `toml:"speed_up"`
 	PitchDown   string `toml:"pitch_down"`
 	PitchUp     string `toml:"pitch_up"`
 	Reset       string `toml:"reset"`
+	Vinyl       string `toml:"vinyl"`
+	Shuffle     string `toml:"shuffle"`
+	Repeat      string `toml:"repeat"`
 	Search      string `toml:"search"`
 	Quit        string `toml:"quit"`
 }
@@ -53,8 +58,9 @@ func Defaults() Config {
 		},
 		Keybindings: Keybindings{
 			Toggle: " ", Stop: "s", Next: "n", Prev: "p", SeekBack: "left", SeekForward: "right",
-			VolumeDown: "down", VolumeUp: "up", SpeedDown: "[", SpeedUp: "]",
-			PitchDown: "{", PitchUp: "}", Reset: "r", Search: "/", Quit: "q",
+			Restart: "0", VolumeDown: "down", VolumeUp: "up", Mute: "m", SpeedDown: "[", SpeedUp: "]",
+			PitchDown: "{", PitchUp: "}", Reset: "r", Vinyl: "v", Shuffle: "z", Repeat: "c",
+			Search: "/", Quit: "q",
 		},
 	}
 }

@@ -24,18 +24,22 @@ const outputRate = 44100
 type Action string
 
 const (
-	Toggle Action = "toggle"
-	Stop   Action = "stop"
-	Next   Action = "next"
-	Prev   Action = "previous"
-	Seek   Action = "seek"
-	Volume Action = "volume"
-	Speed  Action = "speed"
-	Pitch  Action = "pitch"
-	Reset  Action = "reset"
-	Vinyl  Action = "vinyl"
-	EQ     Action = "eq"
-	Select Action = "select"
+	Toggle  Action = "toggle"
+	Stop    Action = "stop"
+	Next    Action = "next"
+	Prev    Action = "previous"
+	Seek    Action = "seek"
+	Restart Action = "restart"
+	Volume  Action = "volume"
+	Mute    Action = "mute"
+	Speed   Action = "speed"
+	Pitch   Action = "pitch"
+	Reset   Action = "reset"
+	Vinyl   Action = "vinyl"
+	Shuffle Action = "shuffle"
+	Repeat  Action = "repeat"
+	EQ      Action = "eq"
+	Select  Action = "select"
 )
 
 type Command struct {
@@ -56,7 +60,10 @@ type Status struct {
 	Speed      float64
 	Pitch      float64
 	Volume     float64
+	Muted      bool
 	Vinyl      bool
+	Shuffle    bool
+	Repeat     RepeatMode
 	EQ         [3]float64
 	Peak       float64
 	RMS        float64
@@ -69,7 +76,6 @@ type Engine struct {
 	tracks       []library.Track
 	commands     chan Command
 	updates      chan Status
-	status       Status
 	loading      bool
 	control      *beep.Ctrl
 	stream       *transportStreamer
@@ -77,10 +83,14 @@ type Engine struct {
 	decodeCancel chan struct{}
 	decodeDone   chan struct{}
 	index        int
+	order        playOrder
 	speed        float64
 	pitch        float64
 	volume       float64
+	muted        bool
 	vinyl        bool
+	shuffle      bool
+	repeat       RepeatMode
 	eq           [3]float64
 	playing      bool
 	errText      string
@@ -99,6 +109,7 @@ func NewEngine(tracks []library.Track) (*Engine, error) {
 	e := &Engine{
 		tracks: tracks, commands: make(chan Command, 32), updates: make(chan Status, 1),
 		speed: 1, volume: 0.8, eq: [3]float64{1, 1, 1},
+		repeat: RepeatAll, order: newPlayOrder(len(tracks)),
 		stop: make(chan struct{}), done: make(chan struct{}),
 	}
 	go e.run()
@@ -145,7 +156,7 @@ func (e *Engine) run() {
 				speaker.Unlock()
 			}
 			if e.stream != nil && e.playing && done {
-				e.selectTrack((e.index+1)%len(e.tracks), true)
+				e.advanceTrack()
 			}
 			e.publish()
 		}
@@ -170,9 +181,11 @@ func (e *Engine) handle(command Command) {
 			speaker.Unlock()
 		}
 	case Next:
-		e.selectTrack((e.index+1)%len(e.tracks), true)
+		next, _ := e.order.advance(1)
+		e.selectTrack(next, true)
 	case Prev:
-		e.selectTrack((e.index-1+len(e.tracks))%len(e.tracks), true)
+		prev, _ := e.order.advance(-1)
+		e.selectTrack(prev, true)
 	case Select:
 		index := int(command.Value)
 		if index >= 0 && index < len(e.tracks) {
@@ -184,13 +197,18 @@ func (e *Engine) handle(command Command) {
 			e.stream.Seek(e.stream.PositionSeconds() + command.Value)
 			speaker.Unlock()
 		}
-	case Volume:
-		e.volume = clamp(e.volume+command.Value, 0, 1)
+	case Restart:
 		if e.stream != nil {
 			speaker.Lock()
-			e.stream.SetVolume(e.volume)
+			e.stream.Seek(0)
 			speaker.Unlock()
 		}
+	case Volume:
+		e.volume = clamp(e.volume+command.Value, 0, 1)
+		e.applyVolume()
+	case Mute:
+		e.muted = !e.muted
+		e.applyVolume()
 	case Speed:
 		e.speed = clamp(e.speed+command.Value, 0.5, 2)
 		e.configureTransport()
@@ -203,6 +221,16 @@ func (e *Engine) handle(command Command) {
 	case Vinyl:
 		e.vinyl = !e.vinyl
 		e.configureTransport()
+	case Shuffle:
+		e.shuffle = !e.shuffle
+		if e.shuffle {
+			e.order.shuffle()
+		} else {
+			e.order.reset(len(e.tracks))
+			e.order.setCurrent(e.index)
+		}
+	case Repeat:
+		e.repeat = e.repeat.next()
 	case EQ:
 		if command.Band >= 0 && command.Band < len(e.eq) {
 			e.eq[command.Band] = clamp(e.eq[command.Band]+command.Value, 0, 2)
@@ -226,6 +254,7 @@ func (e *Engine) selectTrack(index int, autoplay bool) {
 	}
 	e.stopDecoder()
 	e.index = index
+	e.order.setCurrent(index)
 	e.errText = ""
 	e.playing = false
 	e.loading = true
@@ -261,7 +290,7 @@ func (e *Engine) selectTrack(index int, autoplay bool) {
 	}
 	e.source = source
 	e.stream = newBufferedTransportStreamer(source, outputRate)
-	e.stream.SetVolume(e.volume)
+	e.stream.SetVolume(e.effectiveVolume())
 	for band, value := range e.eq {
 		e.stream.SetEQ(band, value)
 	}
@@ -291,11 +320,49 @@ func (e *Engine) configureTransport() {
 	speaker.Unlock()
 }
 
+// effectiveVolume collapses the stored volume with the mute state. Muting is
+// non-destructive: the volume setting is preserved so unmuting restores it.
+func (e *Engine) effectiveVolume() float64 {
+	if e.muted {
+		return 0
+	}
+	return e.volume
+}
+
+func (e *Engine) applyVolume() {
+	if e.stream == nil {
+		return
+	}
+	speaker.Lock()
+	e.stream.SetVolume(e.effectiveVolume())
+	speaker.Unlock()
+}
+
+// advanceTrack selects what plays next when the current track ends, honoring
+// repeat and shuffle. With repeat off at the end of the order it rewinds and
+// pauses instead of looping.
+func (e *Engine) advanceTrack() {
+	next, stop := repeatAdvance(&e.order, e.index, e.repeat, e.shuffle)
+	if stop {
+		e.playing = false
+		if e.control != nil {
+			speaker.Lock()
+			e.control.Paused = true
+			e.stream.Seek(0)
+			speaker.Unlock()
+		}
+		e.publish()
+		return
+	}
+	e.selectTrack(next, true)
+}
+
 func (e *Engine) publish() {
 	status := Status{
 		Index: e.index, Count: len(e.tracks), Playing: e.playing,
 		Loading: e.loading, Speed: e.speed, Pitch: e.pitch, Volume: e.volume,
-		Vinyl: e.vinyl, EQ: e.eq, Err: e.errText,
+		Muted: e.muted, Vinyl: e.vinyl, Shuffle: e.shuffle, Repeat: e.repeat,
+		EQ: e.eq, Err: e.errText,
 	}
 	if len(e.tracks) > 0 {
 		status.Track = e.tracks[e.index]
@@ -317,7 +384,6 @@ func (e *Engine) publish() {
 			status.Err = sourceErr.Error()
 		}
 	}
-	e.status = status
 	select {
 	case e.updates <- status:
 	default:
