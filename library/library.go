@@ -42,6 +42,35 @@ const maxScanWorkers = 8
 // incremental.
 const maxTagBatch = 512
 
+// maxLabelRunes bounds a display label so a corrupt or hostile tag cannot make
+// the renderer allocate an enormous string.
+const maxLabelRunes = 256
+
+// StripControl removes control characters (including the ANSI escape introducer
+// and other C0/C1 controls) and invalid UTF-8 from text, without trimming or
+// length-bounding it. It is for text the user is actively typing (searches,
+// playlist names) where a trailing space is meaningful.
+func StripControl(text string) string {
+	return strings.Map(func(r rune) rune {
+		if r < 0x20 || r == 0x7f || (r >= 0x80 && r <= 0x9f) {
+			return -1
+		}
+		return r
+	}, strings.ToValidUTF8(text, ""))
+}
+
+// SanitizeText cleans an untrusted display label (tag metadata or a filename):
+// control characters and invalid UTF-8 are removed, and the result is
+// length-bounded and trimmed. This keeps hostile metadata from injecting
+// terminal escape sequences or otherwise manipulating the UI.
+func SanitizeText(text string) string {
+	runes := []rune(StripControl(text))
+	if len(runes) > maxLabelRunes {
+		runes = runes[:maxLabelRunes]
+	}
+	return strings.TrimSpace(string(runes))
+}
+
 // TagUpdate reports the tagged metadata for the track at Index.
 type TagUpdate struct {
 	Index int
@@ -107,7 +136,7 @@ func FallbackTracks(paths []string) []Track {
 }
 
 func fallbackTrack(path string) Track {
-	return Track{Path: path, Title: strings.TrimSuffix(filepath.Base(path), filepath.Ext(path))}
+	return Track{Path: path, Title: SanitizeText(strings.TrimSuffix(filepath.Base(path), filepath.Ext(path)))}
 }
 
 // tagReader reads metadata for one path. It is a variable so tests can
@@ -252,10 +281,10 @@ func readTrack(path string) Track {
 		_ = file.Close()
 		if metaErr == nil {
 			if metadata.Title() != "" {
-				track.Title = metadata.Title()
+				track.Title = SanitizeText(metadata.Title())
 			}
-			track.Artist = metadata.Artist()
-			track.Album = metadata.Album()
+			track.Artist = SanitizeText(metadata.Artist())
+			track.Album = SanitizeText(metadata.Album())
 		}
 	}
 	return track

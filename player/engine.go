@@ -46,6 +46,15 @@ const (
 	// Revision is echoed in every subsequent Status so the UI can tell when the
 	// swap has landed and only then trust index-based fields.
 	SetTracks Action = "settracks"
+	// Crossfade adjusts the runtime crossfade by Value milliseconds (which may
+	// be negative); CrossfadeToggle flips it on/off, restoring the last
+	// non-zero duration. ReplayGain cycles the loudness-normalization mode, and
+	// Preamp adjusts the ReplayGain preamp by Value dB. All four are session
+	// settings and are not written to state.toml unless saved explicitly.
+	Crossfade       Action = "crossfade"
+	CrossfadeToggle Action = "crossfade_toggle"
+	ReplayGain      Action = "replaygain"
+	Preamp          Action = "preamp"
 )
 
 type Command struct {
@@ -94,6 +103,11 @@ type Status struct {
 	// loaded one (0 when the loaded track opened cleanly). It is informational:
 	// the deck surfaces it so a silent jump over a corrupt file is explained.
 	Skipped int
+	// CrossfadeMS is the *runtime* crossfade duration (0 when disabled) and
+	// PreampDB is the runtime ReplayGain preamp. Both may differ from the
+	// config file after the user adjusts them while VYNL runs.
+	CrossfadeMS int
+	PreampDB    float64
 }
 
 type Engine struct {
@@ -129,13 +143,16 @@ type Engine struct {
 	eqHighHz    float64
 	// crossfadeFrames is the crossfade overlap in output frames; the queue
 	// holds the live copy (q.crossfade) that the callback reads.
-	crossfadeFrames int
-	analyzer        *spectrumAnalyzer
-	waveform        [analyzerSize]float32
-	spectrum        [SpectrumBands]float64
-	stop            chan struct{}
-	done            chan struct{}
-	closeOnce       sync.Once
+	// crossfadeRestoreMS remembers the last non-zero duration so the toggle can
+	// turn crossfade back on where the user left it.
+	crossfadeFrames    int
+	crossfadeRestoreMS int
+	analyzer           *spectrumAnalyzer
+	waveform           [analyzerSize]float32
+	spectrum           [SpectrumBands]float64
+	stop               chan struct{}
+	done               chan struct{}
+	closeOnce          sync.Once
 
 	// persistMu guards the race-free snapshot a non-engine goroutine (main, at
 	// shutdown) reads. It is never held while taking speaker.Lock or ring.mu,
@@ -224,6 +241,10 @@ func (e *Engine) applyInitial(initial InitialState) {
 	e.eqLowHz = initial.EQLowHz
 	e.eqHighHz = initial.EQHighHz
 	e.crossfadeFrames = crossfadeFramesFor(initial.CrossfadeMS)
+	e.crossfadeRestoreMS = e.crossfadeMS()
+	if e.crossfadeRestoreMS <= 0 {
+		e.crossfadeRestoreMS = defaultCrossfadeMS
+	}
 	if e.speed == 0 {
 		e.speed = 1
 	}
@@ -384,6 +405,24 @@ func (e *Engine) handle(command Command) {
 			e.eq[command.Band] = clamp(e.eq[command.Band]+command.Value, 0, 2)
 			e.applyEQ(command.Band)
 		}
+	case Crossfade:
+		e.setCrossfadeMS(e.crossfadeMS() + int(command.Value))
+	case CrossfadeToggle:
+		if e.crossfadeFrames > 0 {
+			e.setCrossfadeMS(0)
+		} else {
+			restore := e.crossfadeRestoreMS
+			if restore <= 0 {
+				restore = defaultCrossfadeMS
+			}
+			e.setCrossfadeMS(restore)
+		}
+	case ReplayGain:
+		e.replayGain = nextReplayGain(e.replayGain)
+		e.applyReplayGain()
+	case Preamp:
+		e.preampDB = clamp(e.preampDB+command.Value, -12, 12)
+		e.applyReplayGain()
 	}
 	e.publish()
 }
@@ -526,12 +565,9 @@ func (e *Engine) configureStream(stream *trackStream) {
 	// ReplayGain metadata is read on the engine side (the UI's tagged list
 	// lives on the event loop and the engine owns a clone), and only when
 	// enabled so the default "off" mode adds no I/O.
-	if e.replayGain != "off" {
-		if gain := e.trackGain(library.ReadReplayGain(stream.path)); gain > 0 {
-			stream.transport.SetTrackGain(gain)
-			stream.trackGainDB = 20 * math.Log10(gain)
-		}
-	}
+	gain, gainDB := e.replayGainFor(stream.path)
+	stream.transport.SetTrackGain(gain)
+	stream.trackGainDB = gainDB
 	stream.transport.Configure(e.speed, e.effectivePitch())
 }
 
@@ -724,6 +760,14 @@ func (e *Engine) effectiveVolume() float64 {
 	return e.volume
 }
 
+// maxCrossfadeMS mirrors config.maxCrossfadeMS; the engine clamps again so a
+// runtime adjustment cannot exceed the configured bound.
+const maxCrossfadeMS = 30000
+
+// defaultCrossfadeMS is restored when the user toggles crossfade on without a
+// previously set non-zero duration.
+const defaultCrossfadeMS = 4000
+
 // crossfadeFramesFor converts a crossfade duration into output frames, clamped
 // to [0, 30 s] so a typo cannot create an hour-long overlap.
 func crossfadeFramesFor(ms int) int {
@@ -768,6 +812,107 @@ func (e *Engine) trackGain(rg library.ReplayGain) float64 {
 	}
 	// Clamp to a musical range; the soft limiter handles any residual peaks.
 	return math.Pow(10, clamp(db+e.preampDB, -24, 12)/20)
+}
+
+// replayGainFor returns the linear ReplayGain gain and its dB form for a track
+// path under the current mode. It reads tags, so callers must not hold
+// speaker.Lock. The default "off" mode short-circuits to unity with no I/O.
+func (e *Engine) replayGainFor(path string) (gain, gainDB float64) {
+	if e.replayGain == "off" {
+		return 1, 0
+	}
+	gain = e.trackGain(library.ReadReplayGain(path))
+	if gain <= 0 || gain == 1 {
+		return gain, 0
+	}
+	return gain, 20 * math.Log10(gain)
+}
+
+// applyReplayGain re-reads and re-applies the track gain to every live stream
+// after the mode or preamp changes, so the setting takes effect without
+// restarting playback. Tag I/O happens outside speaker.Lock so the audio
+// callback is never blocked.
+func (e *Engine) applyReplayGain() {
+	if e.queue == nil {
+		return
+	}
+	speaker.Lock()
+	streams := e.activeStreamsLocked()
+	speaker.Unlock()
+
+	gains := make([]float64, len(streams))
+	gainDBs := make([]float64, len(streams))
+	for i, stream := range streams {
+		gains[i], gainDBs[i] = e.replayGainFor(stream.path)
+	}
+
+	speaker.Lock()
+	for i, stream := range streams {
+		stream.transport.SetTrackGain(gains[i])
+		stream.trackGainDB = gainDBs[i]
+	}
+	if e.current != nil {
+		e.trackGainDB = e.current.trackGainDB
+	}
+	speaker.Unlock()
+}
+
+// activeStreamsLocked returns the primary, pending, and fading streams. Callers
+// must hold speaker.Lock.
+func (e *Engine) activeStreamsLocked() []*trackStream {
+	streams := make([]*trackStream, 0, 3)
+	if e.queue.primary != nil {
+		streams = append(streams, e.queue.primary)
+	}
+	if e.queue.pending != nil {
+		streams = append(streams, e.queue.pending)
+	}
+	if e.queue.fading != nil {
+		streams = append(streams, e.queue.fading)
+	}
+	return streams
+}
+
+// crossfadeMS is the runtime crossfade duration in milliseconds.
+func (e *Engine) crossfadeMS() int {
+	if e.crossfadeFrames <= 0 {
+		return 0
+	}
+	return e.crossfadeFrames * 1000 / outputRate
+}
+
+// setCrossfadeMS applies a runtime crossfade duration. It updates the queue's
+// live copy under speaker.Lock so the audio callback sees a consistent value,
+// and never interrupts the current track.
+func (e *Engine) setCrossfadeMS(ms int) {
+	if ms < 0 {
+		ms = 0
+	}
+	if ms > maxCrossfadeMS {
+		ms = maxCrossfadeMS
+	}
+	e.crossfadeFrames = crossfadeFramesFor(ms)
+	if ms > 0 {
+		e.crossfadeRestoreMS = ms
+	}
+	if e.queue != nil {
+		speaker.Lock()
+		e.queue.crossfade = e.crossfadeFrames
+		speaker.Unlock()
+	}
+}
+
+// nextReplayGain cycles off -> track -> album -> off. An unrecognized or empty
+// mode is treated as off, mirroring normalizeReplayGain.
+func nextReplayGain(mode string) string {
+	switch mode {
+	case "track":
+		return "album"
+	case "album":
+		return "off"
+	default:
+		return "track"
+	}
 }
 
 func (e *Engine) applyVolume() {
@@ -833,6 +978,7 @@ func (e *Engine) publish() {
 		Muted: e.muted, Vinyl: e.vinyl, Shuffle: e.shuffle, Repeat: e.repeat,
 		EQ: e.eq, Err: e.errText, Revision: e.revision, Skipped: e.skipped,
 		SampleRate: e.sampleRate, ReplayGain: e.replayGain, TrackGainDB: e.trackGainDB,
+		CrossfadeMS: e.crossfadeMS(), PreampDB: e.preampDB,
 	}
 	if len(e.tracks) > 0 {
 		status.Track = e.tracks[e.index]
@@ -901,13 +1047,22 @@ type trackDecoder struct {
 }
 
 func openTrackDecoder(path string) (*trackDecoder, error) {
+	ext := strings.ToLower(filepath.Ext(path))
+	// Validate the extension before touching the filesystem so a path sourced
+	// from a playlist (or any untrusted input) can never make VYNL open an
+	// arbitrary file.
+	switch ext {
+	case ".mp3", ".flac", ".wav", ".ogg":
+	default:
+		return nil, fmt.Errorf("unsupported audio format: %s", filepath.Ext(path))
+	}
 	file, err := os.Open(path)
 	if err != nil {
 		return nil, err
 	}
 	var stream beep.StreamSeekCloser
 	var format beep.Format
-	switch strings.ToLower(filepath.Ext(path)) {
+	switch ext {
 	case ".mp3":
 		stream, format, err = mp3.Decode(file)
 	case ".flac":
@@ -916,8 +1071,6 @@ func openTrackDecoder(path string) (*trackDecoder, error) {
 		stream, format, err = wav.Decode(file)
 	case ".ogg":
 		stream, format, err = vorbis.Decode(file)
-	default:
-		err = fmt.Errorf("unsupported audio format: %s", filepath.Ext(path))
 	}
 	if err != nil {
 		file.Close()

@@ -136,13 +136,6 @@ func (r *pcmRing) freeSpaceLocked() int {
 	return (r.capacity - r.length) + int(drop)
 }
 
-// freeSpace is the test-visible form of freeSpaceLocked.
-func (r *pcmRing) freeSpace() int {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	return r.freeSpaceLocked()
-}
-
 func (r *pcmRing) capacityFrames() int {
 	return r.capacity
 }

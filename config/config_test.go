@@ -38,6 +38,14 @@ func TestDefaultsBindPlaybackControlsDistinctly(t *testing.T) {
 		"top": keys.Top, "bottom": keys.Bottom, "page_up": keys.PageUp, "page_down": keys.PageDown,
 		"eq_low": keys.EQLow, "eq_mid": keys.EQMid, "eq_high": keys.EQHigh,
 		"eq_gain_down": keys.EQGainDown, "eq_gain_up": keys.EQGainUp,
+		"crossfade_toggle": keys.CrossfadeToggle, "crossfade_down": keys.CrossfadeDown,
+		"crossfade_up": keys.CrossfadeUp, "replaygain_cycle": keys.ReplayGainCycle,
+		"preamp_down": keys.PreampDown, "preamp_up": keys.PreampUp,
+		"playlists": keys.Playlists, "playlist_new": keys.PlaylistNew,
+		"playlist_rename": keys.PlaylistRename, "playlist_delete": keys.PlaylistDelete,
+		"playlist_add": keys.PlaylistAdd, "playlist_add_selected": keys.PlaylistAddSelected,
+		"playlist_add_all": keys.PlaylistAddAll, "playlist_move_up": keys.PlaylistMoveUp,
+		"playlist_move_down": keys.PlaylistMoveDown,
 	}
 	seen := map[string]string{}
 	for action, key := range bound {
@@ -102,7 +110,7 @@ func TestLoadStepsDefaultsAndOverrides(t *testing.T) {
 	// Configured steps are loaded; a misconfigured non-positive value falls
 	// back to the default rather than making a transport key a no-op.
 	path := filepath.Join(t.TempDir(), "config.toml")
-	data := "[steps]\nseek = 10.0\nvolume = 0.0\ntempo = 0.25\npitch = 2.0\neq = 0.2\n"
+	data := "[steps]\nseek = 10.0\nvolume = 0.0\ntempo = 0.25\npitch = 2.0\neq = 0.2\ncrossfade = 250.0\npreamp = 2.0\n"
 	if err := os.WriteFile(path, []byte(data), 0o600); err != nil {
 		t.Fatal(err)
 	}
@@ -112,8 +120,17 @@ func TestLoadStepsDefaultsAndOverrides(t *testing.T) {
 	}
 	want := Defaults().Steps
 	want.Seek, want.Tempo, want.Pitch, want.EQ = 10, 0.25, 2, 0.2
+	want.Crossfade, want.Preamp = 250, 2
 	if cfg.Steps != want {
 		t.Fatalf("loaded steps = %+v, want %+v", cfg.Steps, want)
+	}
+}
+
+func TestStepsNormalizeCrossfadeAndPreamp(t *testing.T) {
+	defaults := Defaults().Steps
+	steps := Steps{Crossfade: -1, Preamp: 0}.normalized()
+	if steps.Crossfade != defaults.Crossfade || steps.Preamp != defaults.Preamp {
+		t.Fatalf("non-positive steps normalized to %+v, want defaults %+v", steps, defaults)
 	}
 }
 

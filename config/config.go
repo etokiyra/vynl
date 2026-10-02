@@ -56,6 +56,10 @@ type Steps struct {
 	Tempo  float64 `toml:"tempo"`
 	Pitch  float64 `toml:"pitch"`
 	EQ     float64 `toml:"eq"`
+	// Crossfade is the runtime crossfade step in milliseconds; Preamp is the
+	// ReplayGain preamp step in dB.
+	Crossfade float64 `toml:"crossfade"`
+	Preamp    float64 `toml:"preamp"`
 }
 
 type Keybindings struct {
@@ -91,6 +95,23 @@ type Keybindings struct {
 	EQHigh      string `toml:"eq_high"`
 	EQGainDown  string `toml:"eq_gain_down"`
 	EQGainUp    string `toml:"eq_gain_up"`
+	// Runtime controls and playlist actions. These act on live engine state
+	// (or the playlist browser) and are not persisted to state.toml.
+	CrossfadeToggle     string `toml:"crossfade_toggle"`
+	CrossfadeDown       string `toml:"crossfade_down"`
+	CrossfadeUp         string `toml:"crossfade_up"`
+	ReplayGainCycle     string `toml:"replaygain_cycle"`
+	PreampDown          string `toml:"preamp_down"`
+	PreampUp            string `toml:"preamp_up"`
+	Playlists           string `toml:"playlists"`
+	PlaylistNew         string `toml:"playlist_new"`
+	PlaylistRename      string `toml:"playlist_rename"`
+	PlaylistDelete      string `toml:"playlist_delete"`
+	PlaylistAdd         string `toml:"playlist_add"`
+	PlaylistAddSelected string `toml:"playlist_add_selected"`
+	PlaylistAddAll      string `toml:"playlist_add_all"`
+	PlaylistMoveUp      string `toml:"playlist_move_up"`
+	PlaylistMoveDown    string `toml:"playlist_move_down"`
 }
 
 func Defaults() Config {
@@ -113,8 +134,13 @@ func Defaults() Config {
 			Sort: "o", Search: "/", Rescan: "f5", NowPlaying: "g", Quit: "q",
 			Top: "home", Bottom: "end", PageUp: "pgup", PageDown: "pgdown",
 			EQLow: "1", EQMid: "2", EQHigh: "3", EQGainDown: "-", EQGainUp: "+",
+			CrossfadeToggle: "x", CrossfadeDown: "<", CrossfadeUp: ">",
+			ReplayGainCycle: "j", PreampDown: ",", PreampUp: ".",
+			Playlists: "l", PlaylistNew: "ctrl+n", PlaylistRename: "ctrl+r",
+			PlaylistDelete: "d", PlaylistAdd: "a", PlaylistAddSelected: "A",
+			PlaylistAddAll: "ctrl+a", PlaylistMoveUp: "shift+up", PlaylistMoveDown: "shift+down",
 		},
-		Steps:    Steps{Seek: 5, Volume: 0.05, Tempo: 0.05, Pitch: 1, EQ: 0.1},
+		Steps:    Steps{Seek: 5, Volume: 0.05, Tempo: 0.05, Pitch: 1, EQ: 0.1, Crossfade: 500, Preamp: 1},
 		Playback: Playback{ReplayGain: "off"},
 		EQ:       EQ{LowHz: 250, HighHz: 4000},
 	}
@@ -217,6 +243,12 @@ func (s Steps) normalized() Steps {
 	}
 	if !(s.EQ > 0) {
 		s.EQ = defaults.EQ
+	}
+	if !(s.Crossfade > 0) {
+		s.Crossfade = defaults.Crossfade
+	}
+	if !(s.Preamp > 0) {
+		s.Preamp = defaults.Preamp
 	}
 	return s
 }

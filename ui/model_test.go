@@ -289,7 +289,7 @@ func TestDeckVisualizerStartsAfterControlsAndUsesDenseWidth(t *testing.T) {
 	barCount := 0
 	for _, line := range lines[visualizerRow:] {
 		rowBars := 0
-		for _, glyph := range []rune(line) {
+		for _, glyph := range line {
 			if strings.ContainsRune("▁▂▃▄▅▆▇█┃", glyph) {
 				rowBars++
 			}
@@ -594,6 +594,8 @@ func TestNowPlayingKeyMovesCursorToLoadedTrack(t *testing.T) {
 func TestEQKeysAreConfigurable(t *testing.T) {
 	cfg := config.Defaults()
 	cfg.Keybindings.EQLow, cfg.Keybindings.EQMid, cfg.Keybindings.EQHigh = "j", "k", "l"
+	// Avoid the default playlist-view binding shadowing the rebound high band.
+	cfg.Keybindings.Playlists = "w"
 	model := NewModel(nil, &player.Engine{}, cfg)
 
 	updated, _ := model.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("l")})
@@ -728,17 +730,14 @@ func TestLibraryBoundaryAndPageNavigation(t *testing.T) {
 }
 
 func TestDeckShowsCrossfade(t *testing.T) {
-	cfg := config.Defaults()
-	cfg.Playback.CrossfadeMS = 3000
-	model := NewModel(nil, nil, cfg)
-	model.status = player.Status{Playing: true, Count: 1, Volume: 0.5}
+	model := NewModel(nil, nil, config.Defaults())
+	model.status = player.Status{Playing: true, Count: 1, Volume: 0.5, CrossfadeMS: 3000}
 	panel := ansi.Strip(model.deckPanel(80, 24, model.palette()))
 	if !strings.Contains(panel, "XFADE 3.0s") {
-		t.Fatalf("deck did not show the configured crossfade:\n%s", panel)
+		t.Fatalf("deck did not show the runtime crossfade:\n%s", panel)
 	}
 
-	cfg.Playback.CrossfadeMS = 0
-	model = NewModel(nil, nil, cfg)
+	model.status.CrossfadeMS = 0
 	panel = ansi.Strip(model.deckPanel(80, 24, model.palette()))
 	if strings.Contains(panel, "XFADE") {
 		t.Fatalf("deck showed crossfade while it was disabled:\n%s", panel)

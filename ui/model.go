@@ -18,6 +18,7 @@ import (
 	"github.com/etokiyra/vynl/config"
 	"github.com/etokiyra/vynl/library"
 	"github.com/etokiyra/vynl/player"
+	"github.com/etokiyra/vynl/playlist"
 )
 
 type tickMsg time.Time
@@ -76,6 +77,25 @@ type trackDetails struct {
 	readErr string
 }
 
+// viewMode selects which list the browser panel shows. The engine's active list
+// is tracked separately (activeSource) because the user can browse the library
+// while a playlist plays, or vice versa.
+type viewMode int
+
+const (
+	viewLibrary viewMode = iota
+	viewPlaylists
+)
+
+// promptKind selects the modal text prompt used to name playlists.
+type promptKind int
+
+const (
+	promptNone promptKind = iota
+	promptNewPlaylist
+	promptRenamePlaylist
+)
+
 type Model struct {
 	tracks         []library.Track
 	visible        []int
@@ -104,6 +124,26 @@ type Model struct {
 	deckFocused    bool
 	showHelp       bool
 	sortKey        trackSort
+
+	// Playlists. playlistDir is where they are stored; playlists holds the
+	// loaded set; browse selects which list the browser shows; openPlaylist is
+	// the index of the opened playlist (-1 when showing the list); active is
+	// which list the engine is playing (activePlaylist is meaningful only when
+	// active is viewPlaylists). playlistTracks/playlistMissing are the resolved
+	// entries and their availability.
+	playlistDir      string
+	playlists        []playlist.Playlist
+	browse           viewMode
+	openPlaylist     int
+	playlistSelected int
+	listSelected     int
+	playlistTracks   []library.Track
+	playlistMissing  []bool
+	active           viewMode
+	activePlaylist   int
+	prompt           promptKind
+	promptText       string
+	confirmDelete    int
 
 	// tagUpdates is the asynchronous tag scan stream, if one is running, and
 	// scanCancel cancels its context (covering both the walk and the tag
@@ -135,11 +175,26 @@ type Model struct {
 
 func NewModel(tracks []library.Track, engine *player.Engine, cfg config.Config) Model {
 	m := Model{
-		tracks: tracks,
-		engine: engine,
-		config: cfg,
+		tracks:         tracks,
+		engine:         engine,
+		config:         cfg,
+		openPlaylist:   -1,
+		activePlaylist: -1,
+		confirmDelete:  -1,
 	}
 	m.refreshVisible()
+	return m
+}
+
+// WithPlaylists attaches the playlist directory and the playlists loaded from
+// it. It is a separate method so callers that do not use playlists (and most
+// tests) keep using NewModel unchanged.
+func (m Model) WithPlaylists(dir string, lists []playlist.Playlist) Model {
+	m.playlistDir = dir
+	m.playlists = lists
+	m.openPlaylist = -1
+	m.activePlaylist = -1
+	m.confirmDelete = -1
 	return m
 }
 
@@ -272,7 +327,7 @@ func (m Model) Update(message tea.Msg) (tea.Model, tea.Cmd) {
 		m.rescanning = false
 		switch {
 		case msg.err != nil:
-			m.notice = "Rescan failed: " + msg.err.Error()
+			m.notice = "Rescan failed: " + library.SanitizeText(msg.err.Error())
 		case len(msg.paths) == 0:
 			m.notice = "Rescan found no supported tracks; keeping the current library"
 		default:
@@ -299,12 +354,19 @@ func (m Model) updateKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	if key == "ctrl+c" {
 		return m, tea.Quit
 	}
+	if m.prompt != promptNone {
+		return m.updatePrompt(key, msg)
+	}
+	if m.confirmDelete >= 0 {
+		return m.updateConfirmDelete(key)
+	}
 	if m.showHelp {
 		m.showHelp = false
 		return m, nil
 	}
-	// Boundary/page navigation works in both the library and the search box.
-	if m.handleNavigation(key) {
+	// Boundary/page navigation works in the library list (and the search box);
+	// the playlist browser keeps its own cursor.
+	if m.browse == viewLibrary && m.handleNavigation(key) {
 		return m, nil
 	}
 	if m.searching {
@@ -315,12 +377,13 @@ func (m Model) updateKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			m.refreshVisible()
 			return m, nil
 		case "enter":
+			var command tea.Cmd
 			if len(m.visible) > 0 {
-				m.engine.Send(player.Command{Action: player.Select, Value: float64(m.visible[m.selected])})
+				command = m.startLibraryPlayback(m.visible[m.selected])
 			}
 			m.searching = false
 			m.deckFocused = true
-			return m, nil
+			return m, command
 		case "up":
 			m.moveSelection(-1)
 			return m, nil
@@ -335,10 +398,19 @@ func (m Model) updateKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			return m, nil
 		default:
 			if len(msg.Runes) > 0 {
-				m.search += string(msg.Runes)
+				m.search += library.StripControl(string(msg.Runes))
 				m.refreshVisible()
 			}
 			return m, nil
+		}
+	}
+
+	// The playlist browser owns Up/Down/Enter/Esc and the playlist actions;
+	// other keys fall through to the transport controls so playback can still
+	// be driven while browsing playlists.
+	if m.browse == viewPlaylists {
+		if handled, cmd := m.updatePlaylistKey(key); handled {
+			return m, cmd
 		}
 	}
 
@@ -351,7 +423,10 @@ func (m Model) updateKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		m.showHelp = true
 	case key == "tab":
 		m.deckFocused = !m.deckFocused
+	case key == keys.Playlists:
+		m.toggleBrowse()
 	case key == keys.Search:
+		m.browse = viewLibrary
 		m.searching = true
 		m.search = ""
 		m.selected = 0
@@ -417,17 +492,675 @@ func (m Model) updateKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		m.engine.Send(player.Command{Action: player.EQ, Band: m.eqBand, Value: -steps.EQ})
 	case key == keys.EQGainUp, key == "=":
 		m.engine.Send(player.Command{Action: player.EQ, Band: m.eqBand, Value: steps.EQ})
+	case key == keys.CrossfadeToggle:
+		m.engine.Send(player.Command{Action: player.CrossfadeToggle})
+	case key == keys.CrossfadeDown:
+		m.engine.Send(player.Command{Action: player.Crossfade, Value: -steps.Crossfade})
+	case key == keys.CrossfadeUp:
+		m.engine.Send(player.Command{Action: player.Crossfade, Value: steps.Crossfade})
+	case key == keys.ReplayGainCycle:
+		m.engine.Send(player.Command{Action: player.ReplayGain})
+	case key == keys.PreampDown:
+		m.engine.Send(player.Command{Action: player.Preamp, Value: -steps.Preamp})
+	case key == keys.PreampUp:
+		m.engine.Send(player.Command{Action: player.Preamp, Value: steps.Preamp})
+	case key == keys.PlaylistAdd:
+		m.addPlayingToPlaylist()
+	case key == keys.PlaylistAddSelected:
+		m.addSelectedToPlaylist()
+	case key == keys.PlaylistAddAll:
+		m.addFilteredToPlaylist()
 	case key == "up":
 		m.moveSelection(-1)
 	case key == "down":
 		m.moveSelection(1)
 	case key == "enter":
 		if len(m.visible) > 0 {
-			m.engine.Send(player.Command{Action: player.Select, Value: float64(m.visible[m.selected])})
-			m.deckFocused = true
+			return m, m.startLibraryPlayback(m.visible[m.selected])
 		}
 	}
 	return m, nil
+}
+
+// toggleBrowse switches the browser between the library and the playlists. It
+// never changes what the engine is playing; the playlist panel is a separate
+// view of the same player.
+func (m *Model) toggleBrowse() {
+	if m.browse == viewLibrary {
+		m.browse = viewPlaylists
+	} else {
+		m.browse = viewLibrary
+	}
+}
+
+// updatePlaylistKey handles the keys that belong to the playlist browser. It
+// reports whether the key was consumed; unhandled keys fall through to the
+// transport controls so playback can still be driven from playlist view.
+func (m *Model) updatePlaylistKey(key string) (bool, tea.Cmd) {
+	keys := m.config.Keybindings
+	switch {
+	case key == "up" && !m.deckFocused:
+		if m.openPlaylist >= 0 {
+			m.movePlaylistSelection(-1)
+		} else {
+			m.moveListSelection(-1)
+		}
+		return true, nil
+	case key == "down" && !m.deckFocused:
+		if m.openPlaylist >= 0 {
+			m.movePlaylistSelection(1)
+		} else {
+			m.moveListSelection(1)
+		}
+		return true, nil
+	case key == "home":
+		m.browseToEdge(false)
+		return true, nil
+	case key == "end":
+		m.browseToEdge(true)
+		return true, nil
+	case key == "enter":
+		if m.openPlaylist >= 0 {
+			if len(m.playlistTracks) > 0 {
+				return true, m.startPlaylistPlayback(m.playlistTracks, m.openPlaylist, m.playlistSelected)
+			}
+		} else if m.listSelected >= 0 && m.listSelected < len(m.playlists) {
+			m.openPlaylistAt(m.listSelected)
+		}
+		return true, nil
+	case key == "esc":
+		if m.openPlaylist >= 0 {
+			m.closePlaylist()
+		} else {
+			m.browse = viewLibrary
+		}
+		return true, nil
+	case key == keys.PlaylistNew:
+		m.openPrompt(promptNewPlaylist)
+		return true, nil
+	case key == keys.PlaylistRename:
+		if m.openPlaylist >= 0 || len(m.playlists) > 0 {
+			m.openPrompt(promptRenamePlaylist)
+		} else {
+			m.notice = "No playlist to rename"
+		}
+		return true, nil
+	case key == keys.PlaylistDelete:
+		if m.openPlaylist >= 0 {
+			m.removePlaylistEntry(m.playlistSelected)
+		} else if m.listSelected >= 0 && m.listSelected < len(m.playlists) {
+			m.confirmDelete = m.listSelected
+		}
+		return true, nil
+	case key == keys.PlaylistAdd:
+		m.addPlayingToPlaylist()
+		return true, nil
+	case key == keys.PlaylistAddSelected:
+		m.addSelectedToPlaylist()
+		return true, nil
+	case key == keys.PlaylistAddAll:
+		m.addFilteredToPlaylist()
+		return true, nil
+	case key == keys.PlaylistMoveUp:
+		m.movePlaylistEntry(-1)
+		return true, nil
+	case key == keys.PlaylistMoveDown:
+		m.movePlaylistEntry(1)
+		return true, nil
+	}
+	return false, nil
+}
+
+func (m *Model) browseToEdge(last bool) {
+	if m.openPlaylist >= 0 {
+		if len(m.playlistTracks) == 0 {
+			return
+		}
+		if last {
+			m.playlistSelected = len(m.playlistTracks) - 1
+		} else {
+			m.playlistSelected = 0
+		}
+		return
+	}
+	if len(m.playlists) == 0 {
+		return
+	}
+	if last {
+		m.listSelected = len(m.playlists) - 1
+	} else {
+		m.listSelected = 0
+	}
+}
+
+func (m *Model) moveListSelection(delta int) {
+	if len(m.playlists) == 0 {
+		return
+	}
+	m.listSelected = (m.listSelected + delta + len(m.playlists)) % len(m.playlists)
+}
+
+func (m *Model) movePlaylistSelection(delta int) {
+	if len(m.playlistTracks) == 0 {
+		return
+	}
+	m.playlistSelected = (m.playlistSelected + delta + len(m.playlistTracks)) % len(m.playlistTracks)
+}
+
+// openPlaylistAt opens the playlist at index in the browser (it does not start
+// playback) and resolves its entries.
+func (m *Model) openPlaylistAt(index int) {
+	if index < 0 || index >= len(m.playlists) {
+		return
+	}
+	m.openPlaylist = index
+	m.playlistSelected = 0
+	m.resolvePlaylistTracks()
+}
+
+func (m *Model) closePlaylist() {
+	m.openPlaylist = -1
+	m.playlistTracks = nil
+	m.playlistMissing = nil
+	m.playlistSelected = 0
+}
+
+// resolvePlaylistTracks rebuilds the open playlist's displayed tracks, matching
+// each path against the library for fresh metadata and checking availability
+// without discarding entries that cannot currently be resolved.
+func (m *Model) resolvePlaylistTracks() {
+	m.playlistTracks = nil
+	m.playlistMissing = nil
+	if m.openPlaylist < 0 || m.openPlaylist >= len(m.playlists) {
+		return
+	}
+	paths := m.playlists[m.openPlaylist].Paths
+	m.playlistTracks = make([]library.Track, len(paths))
+	m.playlistMissing = make([]bool, len(paths))
+	for i, path := range paths {
+		track := library.Track{
+			Path:  path,
+			Title: library.SanitizeText(strings.TrimSuffix(filepathBase(path), filepath.Ext(path))),
+		}
+		if index := m.indexOfPath(path); index >= 0 {
+			track = m.tracks[index]
+		}
+		m.playlistTracks[i] = track
+		m.playlistMissing[i] = !playlist.IsPlayable(path)
+	}
+	if m.playlistSelected >= len(m.playlistTracks) {
+		m.playlistSelected = max(0, len(m.playlistTracks)-1)
+	}
+}
+
+// resolveTrack prefers the library's current metadata for a track path (tags
+// stream in after a playlist is opened), falling back to the given copy.
+func (m Model) resolveTrack(track library.Track) library.Track {
+	if index := m.indexOfPath(track.Path); index >= 0 {
+		return m.tracks[index]
+	}
+	return track
+}
+
+func (m Model) currentPlaylist() *playlist.Playlist {
+	if m.openPlaylist >= 0 && m.openPlaylist < len(m.playlists) {
+		return &m.playlists[m.openPlaylist]
+	}
+	return nil
+}
+
+// planPlayback returns the commands that start playing entry from tracks. When
+// the engine is not already on this source it prepends a revisioned SetTracks so
+// the engine's list (and therefore Next/Prev/gapless order) matches. It is pure
+// so tests can assert the exact command sequence.
+func planPlayback(needsSwap bool, revision int, tracks []library.Track, entry int) []player.Command {
+	commands := make([]player.Command, 0, 2)
+	if needsSwap {
+		commands = append(commands, player.Command{Action: player.SetTracks, Tracks: tracks, Revision: revision})
+	}
+	commands = append(commands, player.Command{Action: player.Select, Value: float64(entry)})
+	return commands
+}
+
+// startLibraryPlayback starts (or moves to) a track in the library. The engine
+// only needs a full SetTracks when it is not already playing the library, which
+// avoids re-shuffling the order on every selection. If a rescan is still
+// awaiting its ack, it is adopted first and the track is re-found by path so a
+// replaced list cannot select the wrong entry.
+func (m *Model) startLibraryPlayback(index int) tea.Cmd {
+	if m.engine == nil || index < 0 || index >= len(m.tracks) {
+		return nil
+	}
+	path := m.tracks[index].Path
+	pending := m.adoptPendingLibrary()
+	if resolved := m.indexOfPath(path); resolved >= 0 {
+		index = resolved
+	}
+	needsSwap := m.active != viewLibrary
+	if needsSwap {
+		m.rescanSeq++
+	}
+	for _, command := range planPlayback(needsSwap, m.rescanSeq, m.tracks, index) {
+		m.engine.Send(command)
+	}
+	m.active = viewLibrary
+	m.activePlaylist = -1
+	m.deckFocused = true
+	return tea.Batch(pending...)
+}
+
+// startPlaylistPlayback replaces the engine's active list with the playlist and
+// selects the chosen entry, so Next/Prev and gapless/crossfade follow the
+// playlist order.
+func (m *Model) startPlaylistPlayback(tracks []library.Track, playlistIndex, entry int) tea.Cmd {
+	if m.engine == nil || entry < 0 || entry >= len(tracks) {
+		return nil
+	}
+	pending := m.adoptPendingLibrary()
+	m.rescanSeq++
+	for _, command := range planPlayback(true, m.rescanSeq, tracks, entry) {
+		m.engine.Send(command)
+	}
+	m.active = viewPlaylists
+	m.activePlaylist = playlistIndex
+	m.deckFocused = true
+	return tea.Batch(pending...)
+}
+
+// --- playlist editing -------------------------------------------------------
+
+func (m *Model) openPrompt(kind promptKind) {
+	m.prompt = kind
+	m.promptText = ""
+	if kind == promptRenamePlaylist {
+		if current := m.currentPlaylist(); current != nil {
+			m.promptText = current.Name
+		} else if m.listSelected >= 0 && m.listSelected < len(m.playlists) {
+			m.promptText = m.playlists[m.listSelected].Name
+		}
+	}
+}
+
+func (m Model) updatePrompt(key string, msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	switch key {
+	case "esc":
+		m.prompt = promptNone
+		m.promptText = ""
+	case "enter":
+		m.commitPrompt()
+	case "backspace":
+		if runes := []rune(m.promptText); len(runes) > 0 {
+			m.promptText = string(runes[:len(runes)-1])
+		}
+	default:
+		if len(msg.Runes) > 0 {
+			m.promptText += library.StripControl(string(msg.Runes))
+		}
+	}
+	return m, nil
+}
+
+func (m *Model) commitPrompt() {
+	kind := m.prompt
+	text := m.promptText
+	m.prompt = promptNone
+	m.promptText = ""
+	name, ok := playlist.SanitizeName(text)
+	if !ok {
+		m.notice = "Playlist name cannot be empty"
+		return
+	}
+	switch kind {
+	case promptNewPlaylist:
+		m.createPlaylist(name)
+	case promptRenamePlaylist:
+		m.renameCurrentPlaylist(name)
+	}
+}
+
+func (m *Model) createPlaylist(name string) {
+	if m.playlistDir == "" {
+		m.notice = "Playlists are unavailable"
+		return
+	}
+	for _, existing := range m.playlists {
+		if existing.Name == name {
+			m.notice = "A playlist named " + name + " already exists"
+			return
+		}
+	}
+	file := playlist.FileName(m.playlistDir, name)
+	if err := playlist.Save(playlist.Playlist{Name: name, File: file}); err != nil {
+		m.notice = "Could not create playlist: " + library.SanitizeText(err.Error())
+		return
+	}
+	m.playlists = append(m.playlists, playlist.Playlist{Name: name, File: file})
+	sortPlaylists(m.playlists)
+	m.openPlaylistAt(indexOfPlaylist(m.playlists, file))
+	m.notice = "Created playlist " + name
+}
+
+// renameCurrentPlaylist renames the open playlist (or the highlighted one in the
+// list) by writing the new file and removing the old one. The audio files are
+// never touched.
+func (m *Model) renameCurrentPlaylist(name string) {
+	if m.playlistDir == "" {
+		m.notice = "Playlists are unavailable"
+		return
+	}
+	index := m.openPlaylist
+	wasOpen := index >= 0
+	if !wasOpen {
+		index = m.listSelected
+	}
+	if index < 0 || index >= len(m.playlists) {
+		return
+	}
+	old := m.playlists[index]
+	if old.Name == name {
+		return
+	}
+	newFile := playlist.FileName(m.playlistDir, name)
+	for i, existing := range m.playlists {
+		if i != index && existing.Name == name {
+			m.notice = "A playlist named " + name + " already exists"
+			return
+		}
+	}
+	if err := playlist.Save(playlist.Playlist{Name: name, File: newFile, Paths: old.Paths}); err != nil {
+		m.notice = "Could not rename playlist: " + library.SanitizeText(err.Error())
+		return
+	}
+	_ = playlist.Delete(old.File)
+	m.playlists[index] = playlist.Playlist{Name: name, File: newFile, Paths: old.Paths}
+	sortPlaylists(m.playlists)
+	position := indexOfPlaylist(m.playlists, newFile)
+	if wasOpen {
+		m.openPlaylist = position
+		m.resolvePlaylistTracks()
+	} else {
+		m.listSelected = max(0, position)
+	}
+	m.notice = "Renamed playlist to " + name
+}
+
+// deletePlaylist removes a playlist file and updates the cursors and the
+// engine's active-playlist marker. It never deletes music files.
+func (m *Model) deletePlaylist(index int) {
+	if index < 0 || index >= len(m.playlists) {
+		return
+	}
+	removed := m.playlists[index]
+	if err := playlist.Delete(removed.File); err != nil {
+		m.notice = "Could not delete playlist: " + library.SanitizeText(err.Error())
+		return
+	}
+	m.playlists = append(m.playlists[:index], m.playlists[index+1:]...)
+	if m.active == viewPlaylists {
+		switch {
+		case m.activePlaylist == index:
+			m.activePlaylist = -1
+		case m.activePlaylist > index:
+			m.activePlaylist--
+		}
+	}
+	switch {
+	case m.openPlaylist == index:
+		m.closePlaylist()
+	case m.openPlaylist > index:
+		m.openPlaylist--
+	}
+	if m.listSelected >= len(m.playlists) {
+		m.listSelected = max(0, len(m.playlists)-1)
+	}
+	m.notice = "Deleted playlist " + removed.Name
+}
+
+func (m Model) updateConfirmDelete(key string) (tea.Model, tea.Cmd) {
+	switch key {
+	case "y", "Y", "enter":
+		m.deletePlaylist(m.confirmDelete)
+		m.confirmDelete = -1
+	case "esc", "n", "N":
+		m.confirmDelete = -1
+	}
+	return m, nil
+}
+
+func (m *Model) addPlayingToPlaylist() {
+	m.addPathsToPlaylist([]string{m.status.Track.Path})
+}
+
+func (m *Model) addSelectedToPlaylist() {
+	m.addPathsToPlaylist([]string{m.currentSelectedPath()})
+}
+
+func (m *Model) addFilteredToPlaylist() {
+	paths := make([]string, 0, len(m.visible))
+	for _, index := range m.visible {
+		if index >= 0 && index < len(m.tracks) {
+			paths = append(paths, m.tracks[index].Path)
+		}
+	}
+	m.addPathsToPlaylist(paths)
+}
+
+// addPathsToPlaylist appends resolved paths to the open playlist and saves it.
+// Empty paths are ignored; the playlist size is capped so a save can always be
+// read back.
+func (m *Model) addPathsToPlaylist(paths []string) {
+	current := m.currentPlaylist()
+	if current == nil {
+		m.notice = "Open a playlist first (" + keyLabel(m.config.Keybindings.Playlists) + " then ENTER)"
+		return
+	}
+	added := 0
+	for _, path := range paths {
+		if path == "" {
+			continue
+		}
+		if len(current.Paths) >= playlist.MaxEntries {
+			m.notice = "Playlist is full"
+			break
+		}
+		current.Paths = append(current.Paths, path)
+		added++
+	}
+	if added == 0 {
+		m.notice = "Nothing to add"
+		return
+	}
+	if err := playlist.Save(*current); err != nil {
+		m.notice = "Could not save playlist: " + library.SanitizeText(err.Error())
+		return
+	}
+	m.resolvePlaylistTracks()
+	m.playlistSelected = len(m.playlistTracks) - 1
+	m.notice = fmt.Sprintf("Added %d track(s) to %s", added, current.Name)
+}
+
+func (m *Model) movePlaylistEntry(delta int) {
+	current := m.currentPlaylist()
+	if current == nil {
+		return
+	}
+	target := m.playlistSelected + delta
+	if target < 0 || target >= len(m.playlistTracks) {
+		return
+	}
+	current.Paths[m.playlistSelected], current.Paths[target] = current.Paths[target], current.Paths[m.playlistSelected]
+	m.playlistTracks[m.playlistSelected], m.playlistTracks[target] = m.playlistTracks[target], m.playlistTracks[m.playlistSelected]
+	m.playlistMissing[m.playlistSelected], m.playlistMissing[target] = m.playlistMissing[target], m.playlistMissing[m.playlistSelected]
+	m.playlistSelected = target
+	if err := playlist.Save(*current); err != nil {
+		m.notice = "Could not save playlist: " + library.SanitizeText(err.Error())
+	}
+}
+
+func (m *Model) removePlaylistEntry(index int) {
+	current := m.currentPlaylist()
+	if current == nil || index < 0 || index >= len(current.Paths) {
+		return
+	}
+	current.Paths = append(current.Paths[:index], current.Paths[index+1:]...)
+	if err := playlist.Save(*current); err != nil {
+		m.notice = "Could not save playlist: " + library.SanitizeText(err.Error())
+		return
+	}
+	m.resolvePlaylistTracks()
+	if m.playlistSelected >= len(m.playlistTracks) {
+		m.playlistSelected = max(0, len(m.playlistTracks)-1)
+	}
+	m.notice = "Removed entry"
+}
+
+func sortPlaylists(lists []playlist.Playlist) {
+	sort.Slice(lists, func(i, j int) bool { return lists[i].Name < lists[j].Name })
+}
+
+func indexOfPlaylist(lists []playlist.Playlist, file string) int {
+	for i, list := range lists {
+		if list.File == file {
+			return i
+		}
+	}
+	return -1
+}
+
+// browserPanel renders whichever list the user is browsing.
+func (m Model) browserPanel(width, height int, p palette) string {
+	if m.browse == viewPlaylists {
+		return m.playlistPanel(width, height, p)
+	}
+	return m.libraryPanel(width, height, p)
+}
+
+func (m Model) playlistPanel(width, height int, p palette) string {
+	inner := max(1, width-6)
+	contentHeight := max(0, height-3)
+	var lines []string
+	switch {
+	case m.prompt == promptNewPlaylist:
+		lines = append(lines,
+			p.magenta.Bold(true).Render("NEW PLAYLIST"),
+			p.text.Render(truncate("NAME: "+m.promptText+"_", inner, "")),
+			p.muted.Render("ENTER create   ESC cancel"),
+		)
+	case m.prompt == promptRenamePlaylist:
+		lines = append(lines,
+			p.magenta.Bold(true).Render("RENAME PLAYLIST"),
+			p.text.Render(truncate("NAME: "+m.promptText+"_", inner, "")),
+			p.muted.Render("ENTER rename   ESC cancel"),
+		)
+	case m.confirmDelete >= 0:
+		name := ""
+		if m.confirmDelete < len(m.playlists) {
+			name = m.playlists[m.confirmDelete].Name
+		}
+		lines = append(lines,
+			p.error.Bold(true).Render("DELETE PLAYLIST"),
+			p.text.Render(truncate("Delete "+name+"?", inner, "…")),
+			p.muted.Render("Y confirm   ESC cancel"),
+		)
+	case m.openPlaylist < 0:
+		lines = m.playlistListLines(inner, p)
+	default:
+		lines = m.playlistEntryLines(inner, contentHeight, p)
+	}
+	if m.notice != "" {
+		lines = append(lines, p.error.Render(truncate(m.notice, inner, "…")))
+	}
+	return panel("PLAYLISTS", strings.Join(lines, "\n"), width, height, p.magenta, p.background)
+}
+
+func (m Model) playlistListLines(inner int, p palette) []string {
+	keys := m.config.Keybindings
+	lines := []string{
+		p.muted.Render(fmt.Sprintf("%d PLAYLISTS", len(m.playlists))),
+		p.muted.Render("↑↓ browse   ENTER open   " + keyLabel(keys.PlaylistNew) + " new   " +
+			keyLabel(keys.PlaylistRename) + " rename   " + keyLabel(keys.PlaylistDelete) + " delete"),
+	}
+	if len(m.playlists) == 0 {
+		lines = append(lines, p.muted.Render("No playlists yet — press "+keyLabel(keys.PlaylistNew)+" to create one"))
+		return lines
+	}
+	for i, list := range m.playlists {
+		marker := "  "
+		if m.active == viewPlaylists && m.activePlaylist == i {
+			marker = "▶ "
+		}
+		label := fmt.Sprintf("%s%s  (%d)", marker, list.Name, len(list.Paths))
+		switch {
+		case i == m.listSelected:
+			lines = append(lines, p.cyan.Bold(true).Render(truncate(label, inner, "…")))
+		case marker == "▶ ":
+			lines = append(lines, p.green.Render(truncate(label, inner, "…")))
+		default:
+			lines = append(lines, p.text.Render(truncate(label, inner, "…")))
+		}
+	}
+	return lines
+}
+
+func (m Model) playlistEntryLines(inner, contentHeight int, p palette) []string {
+	keys := m.config.Keybindings
+	name := ""
+	if m.openPlaylist < len(m.playlists) {
+		name = m.playlists[m.openPlaylist].Name
+	}
+	missing := 0
+	for _, unavailable := range m.playlistMissing {
+		if unavailable {
+			missing++
+		}
+	}
+	header := fmt.Sprintf("%s  %d entries", name, len(m.playlistTracks))
+	if missing > 0 {
+		header += fmt.Sprintf("  %d unavailable", missing)
+	}
+	lines := []string{
+		p.text.Bold(true).Render(truncate(header, inner, "…")),
+		p.muted.Render("↑↓ browse   ENTER play   " + keyLabel(keys.PlaylistAdd) + " add playing   " +
+			keyLabel(keys.PlaylistAddSelected) + " add selected   " + keyLabel(keys.PlaylistDelete) + " remove"),
+		p.muted.Render(keyLabel(keys.PlaylistMoveUp) + "/" + keyLabel(keys.PlaylistMoveDown) + " reorder   " +
+			keyLabel(keys.PlaylistRename) + " rename   ESC back"),
+	}
+	if len(m.playlistTracks) == 0 {
+		lines = append(lines, p.muted.Render("Empty — add tracks from the library with "+keyLabel(keys.PlaylistAddSelected)))
+		return lines
+	}
+	rows := max(1, contentHeight-len(lines))
+	start, end := 0, min(len(m.playlistTracks), rows)
+	if len(m.playlistTracks) > end {
+		start = max(0, min(m.playlistSelected-rows/2, len(m.playlistTracks)-rows))
+		end = start + rows
+	}
+	for i := start; i < end; i++ {
+		track := m.resolveTrack(m.playlistTracks[i])
+		title := track.Title
+		if title == "" {
+			title = filepathBase(track.Path)
+		}
+		marker := "  "
+		if m.playlistMissing[i] {
+			marker = "! "
+		}
+		if m.status.Track.Path != "" && track.Path == m.status.Track.Path {
+			marker = "▶ "
+		}
+		label := marker + title
+		switch {
+		case i == m.playlistSelected:
+			lines = append(lines, p.cyan.Bold(true).Render(truncate(label, inner-2, "…")))
+		case m.playlistMissing[i]:
+			lines = append(lines, p.error.Render(truncate(label, inner-2, "…")))
+		case marker == "▶ ":
+			lines = append(lines, p.green.Render(truncate(label, inner-2, "…")))
+		default:
+			lines = append(lines, p.text.Render(truncate(label, inner-2, "…")))
+		}
+	}
+	return lines
 }
 
 // startRescan cancels any in-flight walk/tag scan and kicks off a fresh
@@ -454,7 +1187,23 @@ func (m *Model) startRescan() tea.Cmd {
 // a fresh tag scan for the new list, and returns the command that reads it.
 // Callers must have first observed a Status whose Revision equals
 // pendingRevision, which is what guarantees the engine and UI lists agree.
+// commitRescan adopts the pending track list after the engine has echoed its
+// revision. The engine's list is now the new library, so library playback is the
+// active source.
 func (m *Model) commitRescan() []tea.Cmd {
+	m.active = viewLibrary
+	m.activePlaylist = -1
+	return m.adoptPendingLibrary()
+}
+
+// adoptPendingLibrary installs the pending rescan's library into the UI and
+// restarts tag streaming. It does not change which source the engine is playing:
+// callers decide that (a normal commit is library playback; starting a playlist
+// while a rescan is in flight would otherwise be undone by the ack).
+func (m *Model) adoptPendingLibrary() []tea.Cmd {
+	if m.pendingTracks == nil {
+		return nil
+	}
 	if m.scanCancel != nil {
 		m.scanCancel()
 	}
@@ -465,6 +1214,9 @@ func (m *Model) commitRescan() []tea.Cmd {
 	selectedPath := m.currentSelectedPath()
 	m.tracks = m.pendingTracks
 	m.trackRevision = m.pendingRevision
+	if m.openPlaylist >= 0 {
+		m.resolvePlaylistTracks()
+	}
 	paths := m.pendingPaths
 	m.pendingTracks = nil
 	m.pendingPaths = nil
@@ -518,7 +1270,7 @@ func (m Model) View() string {
 		body = lipgloss.JoinHorizontal(lipgloss.Top,
 			m.deckPanel(deckWidth, bodyHeight, palette),
 			lipgloss.NewStyle().Width(2).Height(bodyHeight).Render(""),
-			m.libraryPanel(browserWidth, bodyHeight, palette),
+			m.browserPanel(browserWidth, bodyHeight, palette),
 		)
 	} else {
 		deckHeight = max(5, bodyHeight*58/100)
@@ -529,7 +1281,7 @@ func (m Model) View() string {
 		}
 		body = lipgloss.JoinVertical(lipgloss.Left,
 			m.deckPanel(deckWidth, deckHeight, palette),
-			m.libraryPanel(browserWidth, browserHeight, palette),
+			m.browserPanel(browserWidth, browserHeight, palette),
 		)
 	}
 	live := "·"
@@ -564,6 +1316,8 @@ func (m Model) helpLine(p palette) string {
 			keyLabel(keys.Mute) + " mute",
 			keyLabel(keys.Shuffle) + " shuffle",
 			keyLabel(keys.Repeat) + " repeat",
+			keyLabel(keys.CrossfadeToggle) + " xfade",
+			keyLabel(keys.ReplayGainCycle) + " rg",
 			keyLabel(keys.Rescan) + " rescan",
 			"TAB library",
 			"? help",
@@ -572,7 +1326,8 @@ func (m Model) helpLine(p palette) string {
 		return p.muted.Render(strings.Join(parts, "  "))
 	}
 	return p.muted.Render("↑/↓ browse   ENTER load   " + keyLabel(keys.Search) +
-		" find   " + keyLabel(keys.Sort) + " sort   " + keyLabel(keys.Rescan) + " rescan   " +
+		" find   " + keyLabel(keys.Sort) + " sort   " + keyLabel(keys.Playlists) + " playlists   " +
+		keyLabel(keys.Rescan) + " rescan   " +
 		keyLabel(keys.Toggle) + " play   " +
 		keyLabel(keys.Next) + "/" + keyLabel(keys.Prev) + " track   " +
 		keyLabel(keys.NowPlaying) + " now   TAB deck   ? help   " + keyLabel(keys.Quit) + " quit")
@@ -632,6 +1387,13 @@ func (m Model) helpEntries() []helpEntry {
 		{keyLabel(keys.PageUp) + " / " + keyLabel(keys.PageDown), "Page up / down"},
 		{keyLabel(keys.EQLow) + " " + keyLabel(keys.EQMid) + " " + keyLabel(keys.EQHigh), "Select EQ band"},
 		{keyLabel(keys.EQGainUp) + " " + keyLabel(keys.EQGainDown), "Adjust selected EQ band"},
+		{keyLabel(keys.CrossfadeToggle) + " " + keyLabel(keys.CrossfadeDown) + " " + keyLabel(keys.CrossfadeUp), "Crossfade on/off and duration"},
+		{keyLabel(keys.ReplayGainCycle), "Cycle ReplayGain off/track/album"},
+		{keyLabel(keys.PreampDown) + " " + keyLabel(keys.PreampUp), "ReplayGain preamp down/up"},
+		{keyLabel(keys.Playlists), "Switch library / playlists"},
+		{keyLabel(keys.PlaylistNew) + " " + keyLabel(keys.PlaylistRename) + " " + keyLabel(keys.PlaylistDelete), "New / rename / delete playlist"},
+		{keyLabel(keys.PlaylistAdd) + " " + keyLabel(keys.PlaylistAddSelected) + " " + keyLabel(keys.PlaylistAddAll), "Add playing / selected / all"},
+		{keyLabel(keys.PlaylistMoveUp) + " " + keyLabel(keys.PlaylistMoveDown), "Reorder playlist entries"},
 		{"TAB", "Switch focus"},
 		{keyLabel(keys.Search), "Search library"},
 		{keyLabel(keys.Quit), "Quit"},
@@ -782,13 +1544,13 @@ func (m Model) deckPanel(width, height int, p palette) string {
 		}
 		modes = append(modes, rg)
 	}
-	if ms := m.config.Playback.CrossfadeMS; ms > 0 {
+	if ms := m.status.CrossfadeMS; ms > 0 {
 		modes = append(modes, fmt.Sprintf("XFADE %.1fs", float64(ms)/1000))
 	}
 	baseLines = append(baseLines, marker+"  "+p.muted.Render(strings.Join(modes, "  ")))
 	baseLines = append(baseLines, p.text.Render(truncate(controlText, inner, "~")))
 	if m.status.Err != "" {
-		baseLines = append(baseLines, p.error.Render(truncate(m.status.Err, inner, "…")))
+		baseLines = append(baseLines, p.error.Render(truncate(library.SanitizeText(m.status.Err), inner, "…")))
 	} else if m.status.Skipped > 0 {
 		baseLines = append(baseLines, p.muted.Render(truncate(
 			fmt.Sprintf("SKIPPED %d UNPLAYABLE", m.status.Skipped), inner, "…")))
@@ -1062,12 +1824,12 @@ func (m Model) currentTrack() library.Track {
 	if m.status.Track.Path == "" {
 		return m.status.Track
 	}
-	// The index is only valid while the UI's list is the one the engine's
-	// status was produced against; verify by path and fall back to the engine's
-	// own copy otherwise, so a rescan can never render a wrong title.
-	if m.status.Index >= 0 && m.status.Index < len(m.tracks) &&
-		m.tracks[m.status.Index].Path == m.status.Track.Path {
-		return m.tracks[m.status.Index]
+	// Resolve by path, not by the engine's index: the engine may be playing a
+	// playlist (or a replaced library), so its index is not an index into
+	// m.tracks. Falling back to the engine's own copy keeps the deck correct
+	// for a track that is not in the library.
+	if index := m.indexOfPath(m.status.Track.Path); index >= 0 {
+		return m.tracks[index]
 	}
 	return m.status.Track
 }
@@ -1289,7 +2051,7 @@ func vinylArt(width int, phase float64, p palette, accents ...lipgloss.Style) []
 			}
 		}
 		var rendered strings.Builder
-		for _, glyph := range []rune(line) {
+		for _, glyph := range line {
 			style := p.cyan
 			if glyph == '#' {
 				style = outerAccent
@@ -1480,14 +2242,13 @@ func truncate(text string, width int, suffix string) string {
 	if width <= 0 {
 		return ""
 	}
-	runes := []rune(text)
 	if lipgloss.Width(text) <= width {
 		return text
 	}
 	limit := max(0, width-lipgloss.Width(suffix))
 	var result strings.Builder
 	used := 0
-	for _, char := range runes {
+	for _, char := range text {
 		charWidth := lipgloss.Width(string(char))
 		if used+charWidth > limit {
 			break

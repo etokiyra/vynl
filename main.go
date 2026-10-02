@@ -15,6 +15,7 @@ import (
 	"github.com/etokiyra/vynl/config"
 	"github.com/etokiyra/vynl/library"
 	"github.com/etokiyra/vynl/player"
+	"github.com/etokiyra/vynl/playlist"
 	"github.com/etokiyra/vynl/ui"
 )
 
@@ -86,8 +87,16 @@ func main() {
 	defer stopScan()
 	tagUpdates := library.ReadTags(scanCtx, paths, runtime.NumCPU())
 
+	// Playlists live beside the config; a missing directory is simply "no
+	// playlists yet", and a corrupt file is reported without hiding the rest.
+	playlistDir := playlist.Dir(path)
+	playlists, playlistErr := playlist.LoadDir(playlistDir)
+	if playlistErr != nil {
+		fmt.Fprintf(os.Stderr, "vynl: ignoring unreadable playlists: %v\n", playlistErr)
+	}
+
 	program := tea.NewProgram(
-		ui.NewModel(tracks, engine, cfg).WithTagUpdates(tagUpdates, stopScan),
+		ui.NewModel(tracks, engine, cfg).WithTagUpdates(tagUpdates, stopScan).WithPlaylists(playlistDir, playlists),
 		tea.WithAltScreen(),
 	)
 	finalModel, runErr := program.Run()

@@ -295,9 +295,12 @@ func (s *transportStreamer) Configure(speed, pitch float64) {
 	s.sourceBase = position
 	s.consumed = 0
 	s.generated = 0
-	s.queue = nil
+	// Reuse the preallocated grain slices rather than dropping them, so a
+	// tempo/pitch change does not force a per-callback allocation on the next
+	// grain (the zero-allocation invariant must survive Configure).
+	s.queue = s.queue[:0]
 	s.queueOffset = 0
-	s.pending = nil
+	s.pending = s.pending[:0]
 	s.started = false
 	s.ring.ensure(int64(math.Floor(position)))
 }
@@ -312,9 +315,9 @@ func (s *transportStreamer) Seek(seconds float64) {
 	s.sourceBase = target
 	s.consumed = 0
 	s.generated = 0
-	s.queue = nil
+	s.queue = s.queue[:0]
 	s.queueOffset = 0
-	s.pending = nil
+	s.pending = s.pending[:0]
 	s.started = false
 	s.lowZ = [2][4]float64{}
 	s.highZ = [2][4]float64{}
@@ -376,14 +379,6 @@ func (s *transportStreamer) CopyWaveform(dst []float32) {
 	for i := 0; i < n; i++ {
 		dst[i] = s.analyzer[(start+i)%analyzerSize]
 	}
-}
-
-func (s *transportStreamer) Done() bool {
-	finished, total := s.ring.status()
-	if !finished {
-		return false
-	}
-	return s.consumed >= s.remainingFramesFor(int(total))
 }
 
 func (s *transportStreamer) remainingFrames() int {

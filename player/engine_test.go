@@ -5,6 +5,7 @@ import (
 	"math"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -145,6 +146,16 @@ func TestStreamSeeksAndResumesThroughRing(t *testing.T) {
 func TestNewEngineRejectsEmptyLibrary(t *testing.T) {
 	if _, err := NewEngine(nil, InitialState{}); err == nil {
 		t.Fatal("NewEngine accepted an empty library")
+	}
+}
+
+// TestOpenTrackDecoderValidatesExtensionFirst ensures a path sourced from a
+// playlist cannot make VYNL open an arbitrary file: an unsupported extension is
+// rejected before the filesystem is touched.
+func TestOpenTrackDecoderValidatesExtensionFirst(t *testing.T) {
+	_, err := openTrackDecoder("/definitely/missing/secret.txt")
+	if err == nil || !strings.Contains(err.Error(), "unsupported audio format") {
+		t.Fatalf("err = %v, want an unsupported-format error before opening", err)
 	}
 }
 
@@ -932,6 +943,103 @@ func TestCrossfadeFramesFor(t *testing.T) {
 	}
 	if got := crossfadeFramesFor(999999); got != 30*outputRate {
 		t.Fatalf("crossfadeFramesFor(huge) = %d, want %d", got, 30*outputRate)
+	}
+}
+
+// TestEngineCrossfadeRuntimeControls covers adjusting the crossfade while VYNL
+// runs: stepping, clamping at zero, and toggling back to the remembered value.
+func TestEngineCrossfadeRuntimeControls(t *testing.T) {
+	engine := engineWithTracks(t, []library.Track{{Path: "a.wav"}})
+
+	engine.handle(Command{Action: Crossfade, Value: 500})
+	if got := engine.crossfadeMS(); got != 500 {
+		t.Fatalf("crossfade after +500 = %d, want 500", got)
+	}
+	if engine.queue.crossfade != crossfadeFramesFor(500) {
+		t.Fatalf("queue crossfade = %d, want %d", engine.queue.crossfade, crossfadeFramesFor(500))
+	}
+
+	engine.handle(Command{Action: Crossfade, Value: 500})
+	if got := engine.crossfadeMS(); got != 1000 {
+		t.Fatalf("crossfade after second +500 = %d, want 1000", got)
+	}
+
+	engine.handle(Command{Action: Crossfade, Value: -99999})
+	if got := engine.crossfadeMS(); got != 0 {
+		t.Fatalf("crossfade did not clamp to 0: %d", got)
+	}
+
+	engine.handle(Command{Action: CrossfadeToggle})
+	if got := engine.crossfadeMS(); got != 1000 {
+		t.Fatalf("toggle-on restored %d, want 1000", got)
+	}
+	engine.handle(Command{Action: CrossfadeToggle})
+	if got := engine.crossfadeMS(); got != 0 {
+		t.Fatalf("toggle-off = %d, want 0", got)
+	}
+	if engine.crossfadeRestoreMS != 1000 {
+		t.Fatalf("restore value = %d, want 1000", engine.crossfadeRestoreMS)
+	}
+
+	status := drainStatus(engine)
+	if status.CrossfadeMS != 0 {
+		t.Fatalf("status crossfade = %d, want the runtime value 0", status.CrossfadeMS)
+	}
+}
+
+func TestEngineCrossfadeRuntimeClampsToMax(t *testing.T) {
+	engine := engineWithTracks(t, []library.Track{{Path: "a.wav"}})
+	engine.handle(Command{Action: Crossfade, Value: 1_000_000})
+	if got := engine.crossfadeMS(); got != maxCrossfadeMS {
+		t.Fatalf("crossfade = %d, want %d", got, maxCrossfadeMS)
+	}
+}
+
+func TestNextReplayGainCyclesOffTrackAlbum(t *testing.T) {
+	cases := []struct{ in, want string }{
+		{"off", "track"},
+		{"track", "album"},
+		{"album", "off"},
+		{"", "track"},
+	}
+	for _, test := range cases {
+		if got := nextReplayGain(test.in); got != test.want {
+			t.Errorf("nextReplayGain(%q) = %q, want %q", test.in, got, test.want)
+		}
+	}
+}
+
+func TestEngineReplayGainAndPreampRuntimeControls(t *testing.T) {
+	engine := engineWithTracks(t, []library.Track{{Path: "a.wav"}})
+
+	engine.handle(Command{Action: ReplayGain})
+	if engine.replayGain != "track" {
+		t.Fatalf("replaygain mode = %q, want track", engine.replayGain)
+	}
+	engine.handle(Command{Action: ReplayGain})
+	if engine.replayGain != "album" {
+		t.Fatalf("replaygain mode = %q, want album", engine.replayGain)
+	}
+	engine.handle(Command{Action: ReplayGain})
+	if engine.replayGain != "off" {
+		t.Fatalf("replaygain mode = %q, want off", engine.replayGain)
+	}
+
+	engine.handle(Command{Action: Preamp, Value: 5})
+	if engine.preampDB != 5 {
+		t.Fatalf("preamp = %.1f, want 5", engine.preampDB)
+	}
+	engine.handle(Command{Action: Preamp, Value: 100})
+	if engine.preampDB != 12 {
+		t.Fatalf("preamp did not clamp high: %.1f", engine.preampDB)
+	}
+	engine.handle(Command{Action: Preamp, Value: -100})
+	if engine.preampDB != -12 {
+		t.Fatalf("preamp did not clamp low: %.1f", engine.preampDB)
+	}
+	status := drainStatus(engine)
+	if status.PreampDB != -12 || status.ReplayGain != "off" {
+		t.Fatalf("status preamp/replaygain = %.1f/%q, want -12/off", status.PreampDB, status.ReplayGain)
 	}
 }
 
