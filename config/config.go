@@ -4,6 +4,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"strings"
 
 	"github.com/pelletier/go-toml/v2"
 )
@@ -41,6 +42,7 @@ type Keybindings struct {
 	Vinyl       string `toml:"vinyl"`
 	Shuffle     string `toml:"shuffle"`
 	Repeat      string `toml:"repeat"`
+	Sort        string `toml:"sort"`
 	Search      string `toml:"search"`
 	Quit        string `toml:"quit"`
 }
@@ -60,7 +62,7 @@ func Defaults() Config {
 			Toggle: " ", Stop: "s", Next: "n", Prev: "p", SeekBack: "left", SeekForward: "right",
 			Restart: "0", VolumeDown: "down", VolumeUp: "up", Mute: "m", SpeedDown: "[", SpeedUp: "]",
 			PitchDown: "{", PitchUp: "}", Reset: "r", Vinyl: "v", Shuffle: "z", Repeat: "c",
-			Search: "/", Quit: "q",
+			Sort: "o", Search: "/", Quit: "q",
 		},
 	}
 }
@@ -85,8 +87,25 @@ func Load(path string) (Config, error) {
 	if err := toml.Unmarshal(data, &cfg); err != nil {
 		return Config{}, err
 	}
+	cfg.MusicDir = ExpandHome(cfg.MusicDir)
 	if cfg.MusicDir == "" {
 		cfg.MusicDir = Defaults().MusicDir
 	}
 	return cfg, nil
+}
+
+// ExpandHome expands a leading "~" or "~/" to the user's home directory. Paths
+// that do not start with "~" are returned unchanged.
+func ExpandHome(path string) string {
+	if path != "~" && !strings.HasPrefix(path, "~/") {
+		return path
+	}
+	home, err := os.UserHomeDir()
+	if err != nil || home == "" {
+		return path
+	}
+	if path == "~" {
+		return home
+	}
+	return filepath.Join(home, path[2:])
 }

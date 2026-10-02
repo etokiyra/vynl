@@ -18,8 +18,8 @@
 
 **VYNL** turns your terminal into a live audio console. It scans a local music
 folder, loads MP3/FLAC/WAV/OGG files, and gives you a deck-style interface with
-a spinning vinyl, a reactive amplitude visualizer, live tempo/pitch/volume
-control, and a 3-band EQ — no GUI, no browser, no bloat. Built with
+a spinning vinyl, a live spectrum analyzer, live tempo/pitch/volume control, and
+a 3-band EQ — no GUI, no browser, no bloat. Built with
 [Bubble Tea](https://github.com/charmbracelet/bubbletea) and
 [beep](https://github.com/gopxl/beep), and designed to look right at home in
 transparent terminals like kitty, foot, or Alacritty.
@@ -37,15 +37,16 @@ transparent terminals like kitty, foot, or Alacritty.
   slow-down/speed-up effect
 - 💿 **Animated vinyl deck** — a genuinely circular, rotating record rendered
   from real coordinate geometry, not ASCII art templates
-- 📊 **Reactive amplitude visualizer** — an RMS-driven procedural animation
-  (per-column sine shaping scaled by RMS); not a spectrum analyzer. Only the
-  stereo L/R VU meters and level readouts are directly signal-derived
+- 📊 **Live spectrum analyzer** — a real 1024-point FFT of the output
+  (Hann-windowed, mapped to 48 log-spaced bands) with peak-hold markers drives
+  the visualizer; the stereo L/R VU meters and numeric level readouts are
+  signal-derived separately
 - 🎛️ **3-band EQ** — low / mid / high gain control, driven by lightweight
   single-pole filters suited for real-time playback
 - 🔀 **Shuffle & repeat** — shuffle the play order, cycle repeat off / all / one,
   and mute or restart the current track from the keyboard
 - 📚 **Local library browser** — scans a folder for supported formats, reads
-  tags, fuzzy search, instant load
+  tags, fuzzy search, sortable browsing, instant load
 - 🔊 **Stereo L/R level meters** and live track metadata (format, bitrate,
   sample rate, file size)
 - 🖤 **Terminal-native transparency** — no hardcoded backgrounds; your
@@ -107,6 +108,8 @@ vynl -config /path/to/config.toml
 | `+` / `-`     | Adjust gain on selected EQ band  |
 | `Tab`         | Switch focus: library ↔ deck     |
 | `/`           | Search library                   |
+| `O`           | Cycle sort: path → title → artist → album |
+| `?`           | Show the full keybinding help    |
 | `Q`           | Quit                              |
 
 > `↑` / `↓` browse the library when it has focus and change volume on the deck;
@@ -118,7 +121,8 @@ vynl -config /path/to/config.toml
 ## Configuration
 
 VYNL reads an optional TOML config from `$XDG_CONFIG_HOME/vynl/config.toml`
-or `~/.config/vynl/config.toml`:
+or `~/.config/vynl/config.toml`. A leading `~` in `music_dir` is expanded to
+your home directory, so `music_dir = "~/Music"` works as expected.
 
 ```toml
 music_dir = "/home/me/Music"
@@ -149,6 +153,7 @@ reset         = "r"
 vinyl         = "v"
 shuffle       = "z"
 repeat        = "c"
+sort          = "o"
 search        = "/"
 quit          = "q"
 ```
@@ -181,8 +186,8 @@ a bug.
 
 ## Known limitations
 
-- Very large libraries (hundreds+ of tracks) may cause a noticeable pause on
-  startup during tag scanning
+- Startup tag scanning runs before the UI appears; it is parallelized, but
+  extremely large libraries may still pause briefly
 - Unreadable folders inside the music directory are skipped during the scan;
   the rest of the library still loads
 - The full decoded audio for the current track is kept in memory, so very long

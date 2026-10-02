@@ -51,6 +51,7 @@ type Command struct {
 type Status struct {
 	Track      library.Track
 	Index      int
+	NextIndex  int
 	Count      int
 	Playing    bool
 	Loading    bool
@@ -69,6 +70,7 @@ type Status struct {
 	RMS        float64
 	ChannelRMS [2]float64
 	BassRMS    float64
+	Spectrum   [SpectrumBands]float64
 	Err        string
 }
 
@@ -94,6 +96,9 @@ type Engine struct {
 	eq           [3]float64
 	playing      bool
 	errText      string
+	analyzer     *spectrumAnalyzer
+	waveform     [analyzerSize]float32
+	spectrum     [SpectrumBands]float64
 	stop         chan struct{}
 	done         chan struct{}
 	closeOnce    sync.Once
@@ -110,7 +115,8 @@ func NewEngine(tracks []library.Track) (*Engine, error) {
 		tracks: tracks, commands: make(chan Command, 32), updates: make(chan Status, 1),
 		speed: 1, volume: 0.8, eq: [3]float64{1, 1, 1},
 		repeat: RepeatAll, order: newPlayOrder(len(tracks)),
-		stop: make(chan struct{}), done: make(chan struct{}),
+		analyzer: newSpectrumAnalyzer(analyzerSize, outputRate),
+		stop:     make(chan struct{}), done: make(chan struct{}),
 	}
 	go e.run()
 	e.Send(Command{Action: Select, Value: 0})
@@ -366,6 +372,11 @@ func (e *Engine) publish() {
 	}
 	if len(e.tracks) > 0 {
 		status.Track = e.tracks[e.index]
+		if len(e.tracks) > 1 {
+			status.NextIndex, _ = e.order.peek(1)
+		} else {
+			status.NextIndex = e.index
+		}
 	}
 	if e.stream != nil {
 		speaker.Lock()
@@ -376,7 +387,16 @@ func (e *Engine) publish() {
 		status.ChannelRMS = e.stream.ChannelRMS()
 		status.BassRMS = e.stream.BassRMS()
 		status.Buffering = e.playing && e.stream.Buffering()
+		if e.playing {
+			e.stream.CopyWaveform(e.waveform[:])
+		}
 		speaker.Unlock()
+		if e.playing {
+			// Analyze after releasing the speaker lock so the FFT never delays
+			// the real-time output callback.
+			e.analyzer.analyze(e.waveform[:], &e.spectrum)
+			status.Spectrum = e.spectrum
+		}
 	}
 	if e.source != nil {
 		_, _, _, sourceErr := e.source.snapshot()

@@ -44,6 +44,31 @@ func TestScanReportsUnreadableRoot(t *testing.T) {
 	}
 }
 
+func TestScanPreservesWalkOrder(t *testing.T) {
+	root := t.TempDir()
+	var names []string
+	for i := 0; i < 25; i++ {
+		name := "track-" + string(rune('a'+i)) + ".mp3"
+		names = append(names, name)
+		if err := os.WriteFile(filepath.Join(root, name), []byte("not audio metadata"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	tracks, err := Scan(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(tracks) != len(names) {
+		t.Fatalf("scanned %d tracks, want %d", len(tracks), len(names))
+	}
+	for i, track := range tracks {
+		if want := filepath.Join(root, names[i]); track.Path != want {
+			t.Fatalf("track %d = %q, want %q", i, track.Path, want)
+		}
+	}
+}
+
 func TestScanFindsSupportedFilesRecursively(t *testing.T) {
 	root := t.TempDir()
 	for _, name := range []string{"set/first.mp3", "second.FLAC", "ignore.txt"} {

@@ -15,6 +15,12 @@ func newPCMBuffer(totalFrames int) *pcmBuffer {
 }
 
 func newPCMBufferWithInitial(totalFrames int, initial []pcmSample) *pcmBuffer {
+	// The container may not report a usable length (some streams report 0).
+	// Never advertise fewer frames than are already buffered, otherwise the
+	// transport considers the track finished before it starts.
+	if totalFrames < len(initial) {
+		totalFrames = len(initial)
+	}
 	return &pcmBuffer{samples: initial, totalFrames: totalFrames}
 }
 

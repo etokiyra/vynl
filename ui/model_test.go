@@ -193,36 +193,51 @@ func TestVinylArtSpinsOnlyDuringPlayback(t *testing.T) {
 	}
 }
 
-func TestWaveformFollowsRMSAmplitude(t *testing.T) {
+func TestSpectrumRowsRenderBandsAndSettleSilent(t *testing.T) {
 	model := NewModel(nil, nil, config.Defaults())
-	model.status.RMS = 0.05
-	quiet := model.waveform(16)
-	model.status.RMS = 0.5
-	loud := model.waveform(16)
-	if quiet == loud {
-		t.Fatal("visualizer bars should change with RMS amplitude")
+	var spectrum [player.SpectrumBands]float64
+	for i := range spectrum {
+		spectrum[i] = float64(i+1) / float64(player.SpectrumBands)
 	}
-	if len([]rune(loud)) != 16 {
-		t.Fatalf("visualizer width = %d, want 16", len([]rune(loud)))
+	rows := spectrumRows(spectrum, [player.SpectrumBands]float64{}, 32, 4, -1, model.palette())
+	if len(rows) != 4 {
+		t.Fatalf("spectrum rendered %d rows, want 4", len(rows))
 	}
-}
-
-func TestSpectrumUsesMultipleRMSDrivenBarsAndSettlesPaused(t *testing.T) {
-	model := NewModel(nil, nil, config.Defaults())
-	p := model.palette()
-	playing := spectrumRows(32, 4, 0.65, 2, true, -1, p)
-	changed := spectrumRows(32, 4, 0.65, 3, true, -1, p)
-	paused := spectrumRows(32, 4, 0.65, 3, false, -1, p)
-	if len(playing) != 4 || strings.Join(playing, "\n") == strings.Join(changed, "\n") {
-		t.Fatal("spectrum should have multiple rows and animate with the audio envelope")
-	}
-	if strings.Contains(strings.Join(paused, ""), "▁") || strings.Contains(strings.Join(paused, ""), "█") {
-		t.Fatal("paused spectrum should settle to empty bars")
-	}
-	for i, row := range playing {
+	for i, row := range rows {
 		if lipgloss.Width(row) != 32 {
 			t.Errorf("spectrum row %d width = %d, want 32", i, lipgloss.Width(row))
 		}
+	}
+	if !strings.ContainsAny(strings.Join(rows, ""), "▁▂▃▄▅▆▇█") {
+		t.Fatal("a non-silent spectrum produced no bars")
+	}
+
+	silent := spectrumRows([player.SpectrumBands]float64{}, [player.SpectrumBands]float64{}, 32, 4, -1, model.palette())
+	if strings.ContainsAny(strings.Join(silent, ""), "▁▂▃▄▅▆▇█") {
+		t.Fatalf("a silent spectrum should render empty bars:\n%s", strings.Join(silent, "\n"))
+	}
+}
+
+func TestSpectrumSmoothsRiseAndDecay(t *testing.T) {
+	model := NewModel(nil, nil, config.Defaults())
+	model.status.Playing = true
+	for i := range model.spectrumTarget {
+		model.spectrumTarget[i] = 1
+	}
+	updated, _ := model.Update(tickMsg(time.Now()))
+	model = updated.(Model)
+	if model.spectrum[0] <= 0 || model.spectrum[0] >= 1 {
+		t.Fatalf("spectrum did not ease toward the target: %.3f", model.spectrum[0])
+	}
+
+	model.status.Playing = false
+	model.spectrumTarget = [player.SpectrumBands]float64{}
+	for i := 0; i < 200 && model.hasPendingEase(); i++ {
+		updated, _ = model.Update(tickMsg(time.Now()))
+		model = updated.(Model)
+	}
+	if model.spectrum[0] > 0.02 {
+		t.Fatalf("spectrum failed to settle after pause: %.3f", model.spectrum[0])
 	}
 }
 
@@ -230,6 +245,9 @@ func TestDeckVisualizerStartsAfterControlsAndUsesDenseWidth(t *testing.T) {
 	model := NewModel(nil, nil, config.Defaults())
 	model.status = player.Status{Playing: true, Speed: 1, Duration: 10, Position: 5, Volume: 0.7, RMS: 0.7}
 	model.rmsLevel = 0.7
+	for i := range model.spectrum {
+		model.spectrum[i] = 1
+	}
 	model.width, model.height = 110, 34
 	lines := strings.Split(ansi.Strip(model.deckPanel(60, 28, model.palette())), "\n")
 	controlRow := -1
@@ -281,6 +299,140 @@ func TestProgressHeadPulsesOnlyWhilePlaying(t *testing.T) {
 	}
 	if paused == playing {
 		t.Fatal("playing progress head should pulse")
+	}
+}
+
+func TestLibraryPanelUsesAvailableHeight(t *testing.T) {
+	tracks := make([]library.Track, 20)
+	for i := range tracks {
+		title := "Track " + string(rune('A'+i))
+		path := "/music/" + string(rune('a'+i)) + ".flac"
+		tracks[i] = library.Track{Title: title, Path: path}
+	}
+	model := NewModel(tracks, nil, config.Defaults())
+	model.status = player.Status{Track: tracks[0], Index: 0, Count: len(tracks)}
+	panel := ansi.Strip(model.libraryPanel(50, 44, model.palette()))
+	shown := 0
+	for _, track := range tracks {
+		if strings.Contains(panel, track.Title) {
+			shown++
+		}
+	}
+	if shown <= 8 {
+		t.Fatalf("tall library panel showed only %d tracks; want more than 8", shown)
+	}
+}
+
+func TestHelpOverlayTogglesAndFitsTerminal(t *testing.T) {
+	for _, size := range [][2]int{{40, 14}, {80, 24}, {120, 36}} {
+		model := NewModel(nil, &player.Engine{}, config.Defaults())
+		model.width, model.height = size[0], size[1]
+
+		updated, _ := model.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("?")})
+		model = updated.(Model)
+		if !model.showHelp {
+			t.Fatalf("? did not open help at %dx%d", size[0], size[1])
+		}
+		view := ansi.Strip(model.View())
+		if !strings.Contains(view, "KEYBINDINGS") || !strings.Contains(view, "SPACE") {
+			t.Fatalf("help overlay missing content at %dx%d:\n%s", size[0], size[1], view)
+		}
+		lines := strings.Split(model.View(), "\n")
+		if len(lines) != size[1] {
+			t.Fatalf("help at %dx%d has %d rows, want %d", size[0], size[1], len(lines), size[1])
+		}
+		for row, line := range lines {
+			if width := lipgloss.Width(line); width != size[0] {
+				t.Fatalf("help at %dx%d row %d is %d wide, want %d", size[0], size[1], row, width, size[0])
+			}
+		}
+
+		updated, _ = model.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("x")})
+		if updated.(Model).showHelp {
+			t.Fatalf("a key press did not close help at %dx%d", size[0], size[1])
+		}
+	}
+}
+
+func TestWindowTitleIncludesTrackAndArtist(t *testing.T) {
+	if got := windowTitle(library.Track{}); got != "VYNL" {
+		t.Fatalf("empty title = %q", got)
+	}
+	if got := windowTitle(library.Track{Path: "/m/a.flac", Title: "Blue", Artist: "Miles"}); got != "VYNL · Blue — Miles" {
+		t.Fatalf("title = %q", got)
+	}
+	if got := windowTitle(library.Track{Path: "/m/track.flac"}); got != "VYNL · track" {
+		t.Fatalf("fallback title = %q", got)
+	}
+}
+
+func TestCompactViewShowsStateTrackAndProgress(t *testing.T) {
+	tracks := []library.Track{{Title: "Compact", Path: "c.flac"}}
+	model := NewModel(tracks, nil, config.Defaults())
+	model.width, model.height = 20, 8
+	model.status = player.Status{Track: tracks[0], Count: 1, Playing: true, Position: 5, Duration: 20}
+	view := ansi.Strip(model.View())
+	if !strings.Contains(view, "PLAYING") || !strings.Contains(view, "Compact") {
+		t.Fatalf("compact view missing state/track:\n%s", view)
+	}
+	if !strings.ContainsAny(view, "━─◆◇") {
+		t.Fatalf("compact view missing progress bar:\n%s", view)
+	}
+}
+
+func TestLibrarySortCycleReordersTracks(t *testing.T) {
+	tracks := []library.Track{
+		{Title: "Alpha", Artist: "Zeta", Album: "One", Path: "a.flac"},
+		{Title: "Zulu", Artist: "Beta", Album: "Two", Path: "b.flac"},
+		{Title: "Mike", Artist: "Alpha", Album: "Two", Path: "c.flac"},
+	}
+	model := NewModel(tracks, &player.Engine{}, config.Defaults())
+	titles := func(m Model) string {
+		out := make([]string, 0, len(m.visible))
+		for _, index := range m.visible {
+			out = append(out, m.tracks[index].Title)
+		}
+		return strings.Join(out, ",")
+	}
+	if got := titles(model); got != "Alpha,Zulu,Mike" {
+		t.Fatalf("default path order = %s", got)
+	}
+
+	model.selected = 0 // keep "Alpha" selected through the reorder
+	updated, _ := model.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("o")})
+	model = updated.(Model)
+	if got := titles(model); got != "Alpha,Mike,Zulu" {
+		t.Fatalf("title order = %s", got)
+	}
+	if model.sortKey.label() != "TITLE" {
+		t.Fatalf("sort label = %s, want TITLE", model.sortKey.label())
+	}
+	if selected := model.tracks[model.visible[model.selected]].Title; selected != "Alpha" {
+		t.Fatalf("sort moved the cursor off the selected track: %s", selected)
+	}
+
+	updated, _ = model.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("o")})
+	model = updated.(Model)
+	if got := titles(model); got != "Mike,Zulu,Alpha" {
+		t.Fatalf("artist order = %s", got)
+	}
+}
+
+func TestDeckShowsNextTrack(t *testing.T) {
+	tracks := []library.Track{
+		{Title: "Current", Path: "a.flac"},
+		{Title: "Upcoming", Path: "b.flac"},
+	}
+	model := NewModel(tracks, nil, config.Defaults())
+	model.status = player.Status{Track: tracks[0], Index: 0, Count: 2, NextIndex: 1, Playing: true, Speed: 1}
+	panel := ansi.Strip(model.deckPanel(80, 24, model.palette()))
+	if !strings.Contains(panel, "NEXT  Upcoming") {
+		t.Fatalf("deck missing next track:\n%s", panel)
+	}
+
+	model.status.Count = 1
+	if got := model.nextTrackTitle(); got != "" {
+		t.Fatalf("single-track next title = %q, want empty", got)
 	}
 }
 
@@ -536,10 +688,46 @@ func TestLibraryUsesMetadataAndStereoMeterForRemainingSpace(t *testing.T) {
 	}
 }
 
+func TestSpectrumHoldLagsFallingBarsAndRenders(t *testing.T) {
+	model := NewModel(nil, nil, config.Defaults())
+	model.status.Playing = true
+	for i := range model.spectrumTarget {
+		model.spectrumTarget[i] = 1
+	}
+	for i := 0; i < 12; i++ {
+		updated, _ := model.Update(tickMsg(time.Now()))
+		model = updated.(Model)
+	}
+	if model.spectrumHold[0] < model.spectrum[0] {
+		t.Fatalf("hold %.3f below bar %.3f while rising", model.spectrumHold[0], model.spectrum[0])
+	}
+
+	model.spectrumTarget = [player.SpectrumBands]float64{}
+	updated, _ := model.Update(tickMsg(time.Now()))
+	model = updated.(Model)
+	if model.spectrumHold[0] <= model.spectrum[0] {
+		t.Fatalf("hold %.3f did not lag the falling bar %.3f", model.spectrumHold[0], model.spectrum[0])
+	}
+
+	var bar, hold [player.SpectrumBands]float64
+	for i := range bar {
+		bar[i] = 0.2
+		hold[i] = 0.8
+	}
+	rendered := strings.Join(spectrumRows(bar, hold, 16, 6, -1, model.palette()), "\n")
+	if !strings.Contains(rendered, "▔") {
+		t.Fatalf("peak-hold marker missing:\n%s", rendered)
+	}
+}
+
 func TestSpectrumScanlineMovesAcrossColumns(t *testing.T) {
 	model := NewModel(nil, nil, config.Defaults())
-	first := strings.Join(spectrumRows(56, 4, 0.5, 1, true, 8, model.palette()), "\n")
-	second := strings.Join(spectrumRows(56, 4, 0.5, 1, true, 21, model.palette()), "\n")
+	var spectrum [player.SpectrumBands]float64
+	for i := range spectrum {
+		spectrum[i] = 0.5
+	}
+	first := strings.Join(spectrumRows(spectrum, [player.SpectrumBands]float64{}, 56, 4, 8, model.palette()), "\n")
+	second := strings.Join(spectrumRows(spectrum, [player.SpectrumBands]float64{}, 56, 4, 21, model.palette()), "\n")
 	if first == second || strings.Count(first, "┃") != 4 || strings.Count(second, "┃") != 4 {
 		t.Fatal("visualizer scanline should move to the requested column across all bar rows")
 	}

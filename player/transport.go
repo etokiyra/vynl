@@ -34,6 +34,7 @@ type transportStreamer struct {
 	queue       []sample
 	queueOffset int
 	pending     []sample
+	grainBuf    []sample
 	started     bool
 	peak        float64
 	rms         float64
@@ -41,6 +42,8 @@ type transportStreamer struct {
 	bassRMS     float64
 	lowAlpha    float64
 	upperAlpha  float64
+	analyzer    [analyzerSize]float32
+	analyzerPos int
 }
 
 func newTransportStreamer(source []pcmSample, sampleRate int) *transportStreamer {
@@ -49,12 +52,15 @@ func newTransportStreamer(source []pcmSample, sampleRate int) *transportStreamer
 
 func newBufferedTransportStreamer(source *pcmBuffer, sampleRate int) *transportStreamer {
 	streamer := &transportStreamer{
-		buffer: source,
-		rate:   float64(sampleRate),
-		speed:  1,
-		pitch:  1,
-		volume: 1,
-		eq:     [3]float64{1, 1, 1},
+		buffer:   source,
+		rate:     float64(sampleRate),
+		speed:    1,
+		pitch:    1,
+		volume:   1,
+		eq:       [3]float64{1, 1, 1},
+		queue:    make([]sample, 0, grainSize),
+		pending:  make([]sample, 0, overlap),
+		grainBuf: make([]sample, grainSize),
 	}
 	streamer.setFilterRates()
 	return streamer
@@ -99,7 +105,7 @@ func (s *transportStreamer) Stream(out [][2]float64) (int, bool) {
 				s.upperState[channel] = upper
 				high := in[channel] - upper
 				mid := upper - low
-				value := (low*s.eq[0] + mid*s.eq[1] + high*s.eq[2]) * s.volume
+				value := softLimit((low*s.eq[0] + mid*s.eq[1] + high*s.eq[2]) * s.volume)
 				out[written][channel] = value
 				channelSquares[channel] += value * value
 				bass := low * s.eq[0] * s.volume
@@ -109,6 +115,8 @@ func (s *transportStreamer) Stream(out [][2]float64) (int, bool) {
 				}
 				sumSquares += value * value
 			}
+			s.analyzer[s.analyzerPos] = float32((out[written][0] + out[written][1]) * 0.5)
+			s.analyzerPos = (s.analyzerPos + 1) % analyzerSize
 			written++
 			s.consumed++
 			frameCount++
@@ -151,8 +159,9 @@ func (s *transportStreamer) generateGrain() bool {
 	if s.started {
 		start = s.alignGrain(nominal)
 	}
-	// Grain playback rate sets pitch; grain-start spacing sets tempo independently.
-	grain := make([]sample, grainSize)
+	// Grain playback rate sets pitch; grain-start spacing sets tempo
+	// independently. The grain buffer is reused so playback never allocates.
+	grain := s.grainBuf
 	for i := range grain {
 		position := start + float64(i)*s.pitch
 		grain[i] = s.interpolate(position)
@@ -224,8 +233,6 @@ func (s *transportStreamer) Configure(speed, pitch float64) {
 	s.queueOffset = 0
 	s.pending = nil
 	s.started = false
-	s.lowState = [2]float64{}
-	s.upperState = [2]float64{}
 }
 
 func (s *transportStreamer) Seek(seconds float64) {
@@ -268,6 +275,17 @@ func (s *transportStreamer) ChannelRMS() [2]float64 { return s.channelRMS }
 
 func (s *transportStreamer) BassRMS() float64 { return s.bassRMS }
 
+// CopyWaveform fills dst with the most recent output samples in chronological
+// order for the spectrum analyzer. Stream mutates the ring, so callers must
+// hold speaker.Lock().
+func (s *transportStreamer) CopyWaveform(dst []float32) {
+	n := min(len(dst), analyzerSize)
+	start := (s.analyzerPos - n + analyzerSize) % analyzerSize
+	for i := 0; i < n; i++ {
+		dst[i] = s.analyzer[(start+i)%analyzerSize]
+	}
+}
+
 func (s *transportStreamer) Done() bool {
 	_, totalFrames, done, _ := s.buffer.snapshot()
 	return done && s.consumed >= s.remainingFramesFor(totalFrames)
@@ -291,6 +309,20 @@ func (s *transportStreamer) setFilterRates() {
 func abs(value float64) float64 {
 	if value < 0 {
 		return -value
+	}
+	return value
+}
+
+// softLimit smoothly saturates the output above |threshold| while remaining
+// exactly transparent below it. This keeps EQ/volume boosts from hard-clipping
+// at the audio device while leaving normal-level signal untouched.
+func softLimit(value float64) float64 {
+	const threshold = 0.9
+	if value > threshold {
+		return threshold + (1-threshold)*math.Tanh((value-threshold)/(1-threshold))
+	}
+	if value < -threshold {
+		return -threshold - (1-threshold)*math.Tanh((-value-threshold)/(1-threshold))
 	}
 	return value
 }

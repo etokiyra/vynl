@@ -28,7 +28,7 @@ func main() {
 		log.Fatal(err)
 	}
 	if *musicDir != "" {
-		cfg.MusicDir = *musicDir
+		cfg.MusicDir = config.ExpandHome(*musicDir)
 	}
 
 	tracks, err := library.Scan(cfg.MusicDir)

@@ -27,6 +27,33 @@ type tickMsg time.Time
 type statusMsg player.Status
 type trackDetailsMsg trackDetails
 
+// trackSort selects how the library list is ordered.
+type trackSort int
+
+const (
+	sortByPath trackSort = iota
+	sortByTitle
+	sortByArtist
+	sortByAlbum
+)
+
+func (s trackSort) label() string {
+	switch s {
+	case sortByTitle:
+		return "TITLE"
+	case sortByArtist:
+		return "ARTIST"
+	case sortByAlbum:
+		return "ALBUM"
+	default:
+		return "PATH"
+	}
+}
+
+func (s trackSort) next() trackSort {
+	return (s + 1) % 4
+}
+
 type trackDetails struct {
 	path       string
 	format     string
@@ -36,28 +63,33 @@ type trackDetails struct {
 }
 
 type Model struct {
-	tracks        []library.Track
-	visible       []int
-	engine        *player.Engine
-	config        config.Config
-	status        player.Status
-	statusAt      time.Time
-	loaded        trackDetails
-	width         int
-	height        int
-	frame         int
-	wheelPhase    float64
-	rmsLevel      float64
-	rmsTarget     float64
-	channelLevel  [2]float64
-	channelTarget [2]float64
-	bassLevel     float64
-	bassTarget    float64
-	selected      int
-	eqBand        int
-	search        string
-	searching     bool
-	deckFocused   bool
+	tracks         []library.Track
+	visible        []int
+	engine         *player.Engine
+	config         config.Config
+	status         player.Status
+	statusAt       time.Time
+	loaded         trackDetails
+	width          int
+	height         int
+	frame          int
+	wheelPhase     float64
+	rmsLevel       float64
+	rmsTarget      float64
+	channelLevel   [2]float64
+	channelTarget  [2]float64
+	bassLevel      float64
+	bassTarget     float64
+	spectrum       [player.SpectrumBands]float64
+	spectrumTarget [player.SpectrumBands]float64
+	spectrumHold   [player.SpectrumBands]float64
+	selected       int
+	eqBand         int
+	search         string
+	searching      bool
+	deckFocused    bool
+	showHelp       bool
+	sortKey        trackSort
 }
 
 func NewModel(tracks []library.Track, engine *player.Engine, cfg config.Config) Model {
@@ -88,6 +120,19 @@ func (m Model) Update(message tea.Msg) (tea.Model, tea.Cmd) {
 			m.channelLevel[channel] += (m.channelTarget[channel] - m.channelLevel[channel]) * 0.32
 		}
 		m.bassLevel += (m.bassTarget - m.bassLevel) * 0.32
+		for band := range m.spectrum {
+			rate := 0.45
+			if m.spectrumTarget[band] < m.spectrum[band] {
+				rate = 0.18 // decay more slowly than the rise for a natural falloff
+			}
+			m.spectrum[band] += (m.spectrumTarget[band] - m.spectrum[band]) * rate
+			switch {
+			case m.spectrum[band] >= m.spectrumHold[band]:
+				m.spectrumHold[band] = m.spectrum[band]
+			case m.spectrumHold[band] > 0:
+				m.spectrumHold[band] = math.Max(m.spectrum[band], m.spectrumHold[band]-0.015)
+			}
+		}
 		if m.status.Playing || m.hasPendingEase() {
 			return m, tick()
 		}
@@ -96,10 +141,12 @@ func (m Model) Update(message tea.Msg) (tea.Model, tea.Cmd) {
 		m.status = player.Status(msg)
 		m.statusAt = time.Now()
 		m.rmsTarget = 0
+		m.spectrumTarget = [player.SpectrumBands]float64{}
 		if m.status.Playing {
 			m.rmsTarget = m.status.RMS
 			m.channelTarget = m.status.ChannelRMS
 			m.bassTarget = m.status.BassRMS
+			m.spectrumTarget = m.status.Spectrum
 		} else {
 			m.channelTarget = [2]float64{}
 			m.bassTarget = 0
@@ -110,7 +157,9 @@ func (m Model) Update(message tea.Msg) (tea.Model, tea.Cmd) {
 			// reads, and load the header off the update loop: decoding a file on
 			// a slow or network-mounted library must not stall rendering.
 			m.loaded = trackDetails{path: m.status.Track.Path}
-			commands = append(commands, loadTrackDetails(m.status.Track.Path))
+			commands = append(commands,
+				loadTrackDetails(m.status.Track.Path),
+				tea.SetWindowTitle(windowTitle(m.status.Track)))
 		}
 		if !wasPlaying && m.status.Playing {
 			commands = append(commands, tick())
@@ -163,10 +212,17 @@ func (m Model) updateKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		}
 	}
 
+	if m.showHelp {
+		m.showHelp = false
+		return m, nil
+	}
+
 	keys := m.config.Keybindings
 	switch {
 	case key == keys.Quit:
 		return m, tea.Quit
+	case key == "?":
+		m.showHelp = true
 	case key == "tab":
 		m.deckFocused = !m.deckFocused
 	case key == keys.Search:
@@ -218,6 +274,9 @@ func (m Model) updateKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		m.engine.Send(player.Command{Action: player.Shuffle})
 	case key == keys.Repeat:
 		m.engine.Send(player.Command{Action: player.Repeat})
+	case key == keys.Sort:
+		m.sortKey = m.sortKey.next()
+		m.refreshVisible()
 	case key == "1", key == "2", key == "3":
 		m.eqBand = int(key[0] - '1')
 	case key == "-":
@@ -242,6 +301,9 @@ func (m Model) View() string {
 		return ""
 	}
 	palette := m.palette()
+	if m.showHelp && m.width >= 24 && m.height >= 12 {
+		return m.helpOverlay(palette)
+	}
 	if m.width < 24 || m.height < 12 {
 		return compactRoot(m, palette)
 	}
@@ -310,13 +372,14 @@ func (m Model) helpLine(p palette) string {
 			keyLabel(keys.Shuffle) + " shuffle",
 			keyLabel(keys.Repeat) + " repeat",
 			"TAB library",
+			"? help",
 			keyLabel(keys.Quit) + " quit",
 		}
 		return p.muted.Render(strings.Join(parts, "  "))
 	}
 	return p.muted.Render("↑/↓ browse   ENTER load   " + keyLabel(keys.Search) +
-		" find   " + keyLabel(keys.Toggle) + " play   " + keyLabel(keys.Next) + "/" + keyLabel(keys.Prev) +
-		" track   TAB deck   " + keyLabel(keys.Quit) + " quit")
+		" find   " + keyLabel(keys.Sort) + " sort   " + keyLabel(keys.Toggle) + " play   " +
+		keyLabel(keys.Next) + "/" + keyLabel(keys.Prev) + " track   TAB deck   ? help   " + keyLabel(keys.Quit) + " quit")
 }
 
 // keyLabel renders a configured key in a form that reads well in the help bar.
@@ -337,6 +400,89 @@ func keyLabel(key string) string {
 		return strings.ToUpper(key)
 	}
 	return key
+}
+
+type helpEntry struct {
+	key    string
+	action string
+}
+
+// helpEntries lists every binding the help overlay documents.
+func (m Model) helpEntries() []helpEntry {
+	keys := m.config.Keybindings
+	return []helpEntry{
+		{keyLabel(keys.Toggle), "Play / pause"},
+		{keyLabel(keys.Stop), "Stop and rewind"},
+		{keyLabel(keys.Next), "Next track"},
+		{keyLabel(keys.Prev), "Previous track"},
+		{keyLabel(keys.SeekBack), "Seek back 5s"},
+		{keyLabel(keys.SeekForward), "Seek forward 5s"},
+		{keyLabel(keys.Restart), "Restart current track"},
+		{keyLabel(keys.VolumeDown), "Volume down"},
+		{keyLabel(keys.VolumeUp), "Volume up"},
+		{keyLabel(keys.Mute), "Mute / unmute"},
+		{keyLabel(keys.SpeedDown), "Tempo down"},
+		{keyLabel(keys.SpeedUp), "Tempo up"},
+		{keyLabel(keys.PitchDown), "Pitch down"},
+		{keyLabel(keys.PitchUp), "Pitch up"},
+		{keyLabel(keys.Reset), "Reset transport"},
+		{keyLabel(keys.Vinyl), "Toggle vinyl mode"},
+		{keyLabel(keys.Shuffle), "Toggle shuffle"},
+		{keyLabel(keys.Repeat), "Cycle repeat off/all/one"},
+		{keyLabel(keys.Sort), "Cycle library sort order"},
+		{"1 2 3", "Select EQ band"},
+		{"+ -", "Adjust selected EQ band"},
+		{"TAB", "Switch focus"},
+		{keyLabel(keys.Search), "Search library"},
+		{keyLabel(keys.Quit), "Quit"},
+		{"?", "Close this help"},
+	}
+}
+
+// helpOverlay renders a full-screen, multi-column keybinding reference that
+// fills exactly m.width x m.height.
+func (m Model) helpOverlay(p palette) string {
+	innerWidth, innerHeight := max(1, m.width-2), max(1, m.height-2)
+	entries := m.helpEntries()
+	keyWidth, actionWidth := 0, 0
+	for _, entry := range entries {
+		keyWidth = max(keyWidth, lipgloss.Width(entry.key))
+		actionWidth = max(actionWidth, lipgloss.Width(entry.action))
+	}
+	const gap = 3
+	entryWidth := keyWidth + 2 + actionWidth
+	columns := max(1, min(3, (innerWidth+gap)/(entryWidth+gap)))
+	rows := max(1, (len(entries)+columns-1)/columns)
+
+	rendered := make([][]string, columns)
+	for index, entry := range entries {
+		column := min(index/rows, columns-1)
+		line := p.cyan.Bold(true).Render(padRight(entry.key, keyWidth)) + "  " +
+			p.text.Render(padRight(entry.action, actionWidth))
+		rendered[column] = append(rendered[column], line)
+	}
+	grid := make([]string, 0, rows)
+	for row := 0; row < rows; row++ {
+		parts := make([]string, 0, columns)
+		for column := 0; column < columns; column++ {
+			if row < len(rendered[column]) {
+				parts = append(parts, rendered[column][row])
+			}
+		}
+		grid = append(grid, strings.Join(parts, strings.Repeat(" ", gap)))
+	}
+	title := p.cyan.Bold(true).Render("KEYBINDINGS") + p.muted.Render("    press any key to close")
+	body := title + "\n\n" + strings.Join(grid, "\n")
+	inner := fixedBlock(body, innerWidth, innerHeight, p.background)
+	return p.background.Width(innerWidth).Height(innerHeight).
+		Border(lipgloss.RoundedBorder()).BorderForeground(p.cyan.GetForeground()).Render(inner)
+}
+
+func padRight(text string, width int) string {
+	if padding := width - lipgloss.Width(text); padding > 0 {
+		return text + strings.Repeat(" ", padding)
+	}
+	return text
 }
 
 func (m Model) deckPanel(width, height int, p palette) string {
@@ -360,6 +506,10 @@ func (m Model) deckPanel(width, height int, p palette) string {
 	}
 	position := m.playbackPosition()
 	remaining := max(0, m.status.Duration-position)
+	timeLine := fmt.Sprintf("%s  /  -%s", clock(position), clock(remaining))
+	if m.status.Duration > 0 {
+		timeLine = fmt.Sprintf("%s  /  %s  /  -%s", clock(position), clock(m.status.Duration), clock(remaining))
+	}
 	status := "PAUSED"
 	if m.status.Loading {
 		status = "LOADING"
@@ -376,9 +526,14 @@ func (m Model) deckPanel(width, height int, p palette) string {
 		p.text.Bold(true).Render(truncate(title, infoWidth, "~")),
 		p.muted.Render(truncate(artist, infoWidth, "~")),
 		p.muted.Render(fmt.Sprintf("TRACK %02d / %02d", m.status.Index+1, max(1, m.status.Count))),
-		p.cyan.Render(progressBar(position, m.status.Duration, infoWidth, m.frame, m.status.Playing)),
-		p.muted.Render(fmt.Sprintf("%s  /  -%s", clock(position), clock(remaining))),
 	}
+	if next := m.nextTrackTitle(); next != "" {
+		info = append(info, p.muted.Render(truncate("NEXT  "+next, infoWidth, "~")))
+	}
+	info = append(info,
+		p.cyan.Render(progressBar(position, m.status.Duration, infoWidth, m.frame, m.status.Playing)),
+		p.muted.Render(timeLine),
+	)
 	top := info
 	if showVinyl {
 		art := vinylArt(vinylWidth, m.wheelPhase, p, m.pulseStyle())
@@ -430,7 +585,7 @@ func (m Model) deckPanel(width, height int, p palette) string {
 	if m.status.Playing && m.status.Duration > 0 {
 		needle = min(min(60, inner)-1, int(position/m.status.Duration*float64(min(60, inner))))
 	}
-	visualizer := spectrumRows(min(60, inner), visualizerHeight, m.visualRMS(), m.frame, m.metersActive(), needle, p)
+	visualizer := spectrumRows(m.spectrum, m.spectrumHold, min(60, inner), visualizerHeight, needle, p)
 	baseLines = append(baseLines, visualizer...)
 	if !m.deckFocused && len(baseLines) > 0 {
 		baseLines[0] += p.muted.Render("  TRACK FOCUS")
@@ -447,14 +602,15 @@ func (m Model) libraryPanel(width, height int, p palette) string {
 	}
 	metaLines := m.loaded.displayLines(m.status.Duration, p)
 	reserved := 2 + 1 + len(metaLines)
+	// Use all the vertical space the panel affords (reserving a few rows for
+	// the metadata block and stereo meter) instead of a fixed track count.
 	maxTracks := max(0, (contentHeight-reserved-3)/entryHeight)
-	maxTracks = min(8, maxTracks)
 	start, end := 0, min(len(m.visible), maxTracks)
 	if len(m.visible) > end {
 		start = max(0, min(m.selected-maxTracks/2, len(m.visible)-maxTracks))
 		end = start + maxTracks
 	}
-	header := fmt.Sprintf("%d TRACKS  /  %d MATCH", len(m.tracks), len(m.visible))
+	header := fmt.Sprintf("%d/%d TRACKS  %s", len(m.visible), len(m.tracks), m.sortKey.label())
 	if query := strings.TrimSpace(m.search); query != "" {
 		header += "  FILTER: " + query
 	}
@@ -547,6 +703,10 @@ func (m *Model) moveSelection(delta int) {
 
 func (m *Model) refreshVisible() {
 	query := strings.ToLower(strings.TrimSpace(m.search))
+	selectedTrack := -1
+	if m.selected >= 0 && m.selected < len(m.visible) {
+		selectedTrack = m.visible[m.selected]
+	}
 
 	type result struct{ index, score int }
 	results := make([]result, 0, len(m.tracks))
@@ -557,13 +717,63 @@ func (m *Model) refreshVisible() {
 			results = append(results, result{i, score})
 		}
 	}
-	sort.SliceStable(results, func(i, j int) bool { return results[i].score < results[j].score })
+	sort.SliceStable(results, func(i, j int) bool {
+		if results[i].score != results[j].score {
+			return results[i].score < results[j].score
+		}
+		return m.lessTrack(results[i].index, results[j].index)
+	})
 	m.visible = m.visible[:0]
 	for _, result := range results {
 		m.visible = append(m.visible, result.index)
 	}
+
+	// Keep the cursor on the same track where possible when the list reorders
+	// or is filtered.
+	if selectedTrack >= 0 {
+		m.selected = 0
+		for position, index := range m.visible {
+			if index == selectedTrack {
+				m.selected = position
+				break
+			}
+		}
+	}
 	if m.selected >= len(m.visible) {
 		m.selected = max(0, len(m.visible)-1)
+	}
+}
+
+// lessTrack orders two tracks by the active sort key, falling back to the path
+// so the ordering is total and deterministic.
+func (m Model) lessTrack(first, second int) bool {
+	a, b := m.tracks[first], m.tracks[second]
+	firstKey, secondKey := m.sortText(a), m.sortText(b)
+	if firstKey != secondKey {
+		return firstKey < secondKey
+	}
+	return a.Path < b.Path
+}
+
+func (m Model) sortText(track library.Track) string {
+	switch m.sortKey {
+	case sortByTitle:
+		if track.Title != "" {
+			return strings.ToLower(track.Title)
+		}
+		return strings.ToLower(filepathBase(track.Path))
+	case sortByArtist:
+		if track.Artist != "" {
+			return strings.ToLower(track.Artist)
+		}
+		return strings.ToLower(track.Album)
+	case sortByAlbum:
+		if track.Album != "" {
+			return strings.ToLower(track.Album)
+		}
+		return strings.ToLower(track.Title)
+	default:
+		return track.Path
 	}
 }
 
@@ -592,24 +802,25 @@ func fuzzyScore(query, candidate string) (int, bool) {
 	return 0, false
 }
 
-func (m Model) waveform(width int) string {
-	levels := "▁▂▃▄▅▆▇█"
-	var line strings.Builder
-	for i := 0; i < width; i++ {
-		columnGain := 0.55 + 0.45*(0.5+0.5*math.Sin(float64(i)*0.63))
-		level := int(math.Round(m.status.RMS * 8 * columnGain))
-		level = min(len(levels)-1, max(0, level))
-		line.WriteRune(rune(levels[level]))
-	}
-	return line.String()
-}
-
 func (m Model) playbackPosition() float64 {
 	position := m.status.Position
 	if m.status.Playing && !m.status.Buffering && !m.statusAt.IsZero() {
 		position += max(0, time.Since(m.statusAt).Seconds()) * max(0, m.status.Speed)
 	}
 	return math.Min(m.status.Duration, math.Max(0, position))
+}
+
+// nextTrackTitle returns the title of the track the engine will play next, or
+// "" when there is nothing meaningful to show.
+func (m Model) nextTrackTitle() string {
+	if m.status.Count <= 1 || m.status.NextIndex < 0 || m.status.NextIndex >= len(m.tracks) {
+		return ""
+	}
+	track := m.tracks[m.status.NextIndex]
+	if track.Title != "" {
+		return track.Title
+	}
+	return filepathBase(track.Path)
 }
 
 func (m Model) visualRMS() float64 {
@@ -632,6 +843,16 @@ func (m Model) hasPendingEase() bool {
 	}
 	for channel := range m.channelLevel {
 		if math.Abs(m.channelLevel[channel]-m.channelTarget[channel]) > 0.008 {
+			return true
+		}
+	}
+	for band := range m.spectrum {
+		if math.Abs(m.spectrum[band]-m.spectrumTarget[band]) > 0.01 {
+			return true
+		}
+	}
+	for band := range m.spectrumHold {
+		if m.spectrumHold[band] > 0.01 {
 			return true
 		}
 	}
@@ -731,20 +952,18 @@ func vinylArt(width int, phase float64, p palette, accents ...lipgloss.Style) []
 	return rows
 }
 
-func spectrumRows(width, height int, rms float64, frame int, playing bool, needle int, p palette) []string {
+func spectrumRows(spectrum, hold [player.SpectrumBands]float64, width, height, needle int, p palette) []string {
 	if height <= 0 || width <= 0 {
 		return nil
 	}
 	width = min(60, width)
 	levels := []rune("▁▂▃▄▅▆▇█")
+	scale := float64(height * len(levels))
 	peaks := make([]int, width)
+	holds := make([]int, width)
 	for column := range peaks {
-		shape := 0.35 + 0.65*math.Abs(math.Sin(float64(column)*0.31+0.8))
-		motion := 0.84 + 0.16*math.Sin(float64(frame)*0.28+float64(column)*0.7)
-		if playing {
-			peaks[column] = int(math.Round(rms * float64(height*len(levels)) * 1.3 * shape * motion))
-		}
-		peaks[column] = max(0, min(height*len(levels)-1, peaks[column]))
+		peaks[column] = max(0, min(height*len(levels)-1, int(math.Round(sampleSpectrum(spectrum, column, width)*scale))))
+		holds[column] = max(0, min(height*len(levels)-1, int(math.Round(sampleSpectrum(hold, column, width)*scale))))
 	}
 	rows := make([]string, height)
 	for row := 0; row < height; row++ {
@@ -752,6 +971,7 @@ func spectrumRows(width, height int, rms float64, frame int, playing bool, needl
 		threshold := (height - row - 1) * len(levels)
 		for column, peak := range peaks {
 			remaining := peak - threshold
+			holdRemaining := holds[column] - threshold
 			glyph := ' '
 			if remaining >= len(levels) {
 				glyph = levels[len(levels)-1]
@@ -764,15 +984,33 @@ func spectrumRows(width, height int, rms float64, frame int, playing bool, needl
 			} else if remaining >= len(levels) {
 				color = p.magenta
 			}
-			if playing && column == needle {
+			switch {
+			case column == needle:
 				line.WriteString(p.text.Bold(true).Render("┃"))
-			} else {
+			case holdRemaining > 0 && holdRemaining <= len(levels) && remaining <= 0:
+				line.WriteString(p.pink.Render("▔"))
+			default:
 				line.WriteString(color.Render(string(glyph)))
 			}
 		}
 		rows[row] = line.String()
 	}
 	return rows
+}
+
+// sampleSpectrum maps a display column onto the band array with linear
+// interpolation so the visualizer stays smooth at any width.
+func sampleSpectrum(spectrum [player.SpectrumBands]float64, column, width int) float64 {
+	if width <= 1 {
+		return spectrum[0]
+	}
+	position := float64(column) * float64(player.SpectrumBands-1) / float64(width-1)
+	low := int(position)
+	if low >= player.SpectrumBands-1 {
+		return spectrum[player.SpectrumBands-1]
+	}
+	fraction := position - float64(low)
+	return spectrum[low]*(1-fraction) + spectrum[low+1]*fraction
 }
 
 func vuInline(rms [2]float64, playing bool, p palette) string {
@@ -863,11 +1101,28 @@ func compactRoot(m Model, p palette) string {
 		track = "No track loaded"
 	}
 	state := "PAUSED"
-	if m.status.Playing {
+	if m.status.Loading {
+		state = "LOADING"
+	} else if m.status.Buffering {
+		state = "BUFFERING"
+	} else if m.status.Playing {
 		state = "PLAYING"
 	}
-	content := p.cyan.Bold(true).Render("VYNL") + "\n" + p.green.Render(state) + "  " + p.text.Render(truncate(track, innerWidth-8, "..."))
-	inner := fixedBlock(content, innerWidth, innerHeight, p.background)
+	if m.status.Muted {
+		state += " / MUTED"
+	}
+	lines := []string{
+		p.cyan.Bold(true).Render("VYNL") + p.muted.Render("  "+state),
+		p.text.Render(truncate(track, innerWidth, "...")),
+	}
+	if innerHeight >= 3 {
+		position := m.playbackPosition()
+		lines = append(lines,
+			p.cyan.Render(progressBar(position, m.status.Duration, innerWidth, m.frame, m.status.Playing)),
+			p.muted.Render(fmt.Sprintf("%s  /  -%s", clock(position), clock(max(0, m.status.Duration-position)))),
+		)
+	}
+	inner := fixedBlock(strings.Join(lines, "\n"), innerWidth, innerHeight, p.background)
 	return p.background.Width(innerWidth).Height(innerHeight).Border(lipgloss.RoundedBorder()).
 		BorderForeground(p.cyan.GetForeground()).Render(inner)
 }
@@ -955,6 +1210,21 @@ func clock(seconds float64) string {
 
 func filepathBase(path string) string {
 	return filepath.Base(path)
+}
+
+// windowTitle builds the terminal title for the currently loaded track.
+func windowTitle(track library.Track) string {
+	if track.Path == "" {
+		return "VYNL"
+	}
+	title := track.Title
+	if title == "" {
+		title = strings.TrimSuffix(filepathBase(track.Path), filepath.Ext(track.Path))
+	}
+	if track.Artist != "" {
+		return "VYNL · " + title + " — " + track.Artist
+	}
+	return "VYNL · " + title
 }
 
 func loadTrackDetails(path string) tea.Cmd {
