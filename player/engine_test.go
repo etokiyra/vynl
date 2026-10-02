@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/etokiyra/vynl/library"
+	"github.com/gopxl/beep"
 )
 
 func TestDecoderPrebuffersThenCompletesTrackInBackground(t *testing.T) {
@@ -164,6 +165,173 @@ func TestEngineDecoderSeeksAndResumesThroughRing(t *testing.T) {
 func TestNewEngineRejectsEmptyLibrary(t *testing.T) {
 	if _, err := NewEngine(nil, InitialState{}); err == nil {
 		t.Fatal("NewEngine accepted an empty library")
+	}
+}
+
+func TestPlanTrackSwapKeepsOrFallsBack(t *testing.T) {
+	tracks := []library.Track{{Path: "a"}, {Path: "b"}}
+	if index, keep := planTrackSwap("b", tracks); !keep || index != 1 {
+		t.Fatalf("present path = (%d, %t), want (1, true)", index, keep)
+	}
+	if index, keep := planTrackSwap("missing", tracks); keep || index != 0 {
+		t.Fatalf("absent path = (%d, %t), want (0, false)", index, keep)
+	}
+	if index, keep := planTrackSwap("", tracks); keep || index != 0 {
+		t.Fatalf("empty path = (%d, %t), want (0, false)", index, keep)
+	}
+}
+
+// TestReplaceTracksKeepsCurrentByPath covers the kept case: the list is
+// replaced, the current track is still present (at a different index), and the
+// live control is left untouched so playback is not interrupted.
+func TestReplaceTracksKeepsCurrentByPath(t *testing.T) {
+	control := &beep.Ctrl{}
+	engine := &Engine{
+		tracks:  []library.Track{{Path: "a"}, {Path: "b"}},
+		index:   1,
+		control: control,
+	}
+	engine.order = newPlayOrder(2)
+	engine.order.setCurrent(1)
+
+	engine.replaceTracks([]library.Track{{Path: "c"}, {Path: "b"}}, 7)
+
+	if len(engine.tracks) != 2 || engine.tracks[1].Path != "b" {
+		t.Fatalf("tracks after kept swap = %+v", engine.tracks)
+	}
+	if engine.index != 1 {
+		t.Fatalf("index after kept swap = %d, want 1", engine.index)
+	}
+	if engine.revision != 7 {
+		t.Fatalf("revision after kept swap = %d, want 7", engine.revision)
+	}
+	if engine.control != control {
+		t.Fatal("kept swap replaced the control; playback would be interrupted")
+	}
+	if got := engine.order.current(); got != 1 {
+		t.Fatalf("play order current = %d, want 1", got)
+	}
+}
+
+// TestHandleSetTracksActionDispatches ensures the replacement goes through the
+// normal actor command path rather than a side channel.
+func TestHandleSetTracksActionDispatches(t *testing.T) {
+	engine := &Engine{tracks: []library.Track{{Path: "a"}, {Path: "b"}}, index: 1}
+	engine.order = newPlayOrder(2)
+	engine.order.setCurrent(1)
+
+	engine.handle(Command{
+		Action:   SetTracks,
+		Tracks:   []library.Track{{Path: "c"}, {Path: "b"}},
+		Revision: 7,
+	})
+
+	if engine.index != 1 || engine.tracks[1].Path != "b" || engine.revision != 7 {
+		t.Fatalf("handle(SetTracks) = index %d, tracks %+v, revision %d", engine.index, engine.tracks, engine.revision)
+	}
+}
+
+// TestReplaceTracksRebuildsShuffleOrder confirms a swap before playback keeps a
+// shuffled order valid and pointed at the current track.
+func TestReplaceTracksRebuildsShuffleOrder(t *testing.T) {
+	engine := &Engine{
+		tracks:  []library.Track{{Path: "a"}, {Path: "b"}, {Path: "c"}},
+		index:   2,
+		shuffle: true,
+	}
+	engine.order = newPlayOrder(3)
+
+	engine.replaceTracks([]library.Track{{Path: "c"}, {Path: "b"}, {Path: "a"}}, 1)
+
+	if engine.index != 0 {
+		t.Fatalf("index after shuffled swap = %d, want 0", engine.index)
+	}
+	if got := engine.order.current(); got != engine.index {
+		t.Fatalf("order current = %d, want %d", got, engine.index)
+	}
+	seen := make([]bool, len(engine.tracks))
+	for _, index := range engine.order.indices {
+		if index < 0 || index >= len(engine.tracks) || seen[index] {
+			t.Fatalf("shuffled order is not a permutation: %v", engine.order.indices)
+		}
+		seen[index] = true
+	}
+}
+
+// TestReplaceTracksRemovedTrackResetsWithoutAudio covers the removed case when
+// nothing is loaded yet (control == nil): the deck is repointed at index 0
+// without trying to open a decoder.
+func TestReplaceTracksRemovedTrackResetsWithoutAudio(t *testing.T) {
+	engine := &Engine{tracks: []library.Track{{Path: "a"}, {Path: "b"}}, index: 1}
+	engine.order = newPlayOrder(2)
+	engine.order.setCurrent(1)
+
+	engine.replaceTracks([]library.Track{{Path: "c"}, {Path: "d"}}, 3)
+
+	if engine.index != 0 || engine.tracks[0].Path != "c" {
+		t.Fatalf("removed swap = index %d, tracks %+v", engine.index, engine.tracks)
+	}
+	if engine.revision != 3 {
+		t.Fatalf("revision after removed swap = %d, want 3", engine.revision)
+	}
+	if got := engine.order.current(); got != 0 {
+		t.Fatalf("order current after removed swap = %d, want 0", got)
+	}
+}
+
+// TestReplaceTracksRemovedBeforePlaybackKeepsShuffleOrder confirms the
+// control == nil reset branch rebuilds the order through rebuildOrder, so a
+// shuffle user who rescans before pressing play keeps a shuffled order.
+func TestReplaceTracksRemovedBeforePlaybackKeepsShuffleOrder(t *testing.T) {
+	engine := &Engine{
+		tracks:  []library.Track{{Path: "a"}, {Path: "b"}, {Path: "c"}, {Path: "d"}},
+		index:   0,
+		shuffle: true,
+	}
+	engine.order = newPlayOrder(4)
+
+	// The current path is absent, so the control == nil branch resets to 0.
+	engine.replaceTracks([]library.Track{{Path: "w"}, {Path: "x"}, {Path: "y"}, {Path: "z"}}, 1)
+
+	if engine.index != 0 || engine.order.current() != 0 {
+		t.Fatalf("index/current = %d/%d, want 0/0", engine.index, engine.order.current())
+	}
+	seen := make([]bool, len(engine.tracks))
+	for _, index := range engine.order.indices {
+		if index < 0 || index >= len(engine.tracks) || seen[index] {
+			t.Fatalf("reset order is not a permutation: %v", engine.order.indices)
+		}
+		seen[index] = true
+	}
+}
+
+func TestReplaceTracksIgnoresEmptyList(t *testing.T) {
+	engine := &Engine{tracks: []library.Track{{Path: "a"}}, index: 0}
+	engine.order = newPlayOrder(1)
+
+	engine.replaceTracks(nil, 9)
+
+	if len(engine.tracks) != 1 || engine.revision != 0 {
+		t.Fatalf("empty replacement changed the engine: tracks %+v, revision %d", engine.tracks, engine.revision)
+	}
+}
+
+func TestPublishCarriesRevisionAndPathKeyedNextTrack(t *testing.T) {
+	engine := &Engine{
+		tracks:   []library.Track{{Path: "a", Title: "A"}, {Path: "b", Title: "B"}},
+		updates:  make(chan Status, 1),
+		revision: 5,
+	}
+	engine.order = newPlayOrder(2)
+
+	engine.publish()
+	status := <-engine.updates
+
+	if status.Revision != 5 {
+		t.Fatalf("status revision = %d, want 5", status.Revision)
+	}
+	if status.Track.Path != "a" || status.NextTrack.Path != "b" {
+		t.Fatalf("status tracks = %+v / next %+v, want a / b", status.Track, status.NextTrack)
 	}
 }
 

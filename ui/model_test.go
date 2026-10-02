@@ -1,7 +1,9 @@
 package ui
 
 import (
+	"context"
 	"encoding/binary"
+	"errors"
 	"math"
 	"os"
 	"path/filepath"
@@ -424,7 +426,7 @@ func TestDeckShowsNextTrack(t *testing.T) {
 		{Title: "Upcoming", Path: "b.flac"},
 	}
 	model := NewModel(tracks, nil, config.Defaults())
-	model.status = player.Status{Track: tracks[0], Index: 0, Count: 2, NextIndex: 1, Playing: true, Speed: 1}
+	model.status = player.Status{Track: tracks[0], Index: 0, Count: 2, NextIndex: 1, NextTrack: tracks[1], Playing: true, Speed: 1}
 	panel := ansi.Strip(model.deckPanel(80, 24, model.palette()))
 	if !strings.Contains(panel, "NEXT  Upcoming") {
 		t.Fatalf("deck missing next track:\n%s", panel)
@@ -765,9 +767,9 @@ func TestTagBatchAppliesUpdatesInPlace(t *testing.T) {
 	}
 	model := NewModel(tracks, nil, config.Defaults())
 	model.sortKey = sortByTitle
-	updated, _ := model.Update(tagBatchMsg([]library.TagUpdate{
+	updated, _ := model.Update(tagBatchMsg{gen: model.scanGen, updates: []library.TagUpdate{
 		{Index: 1, Track: library.Track{Path: "b.flac", Title: "Zed", Artist: "Artist"}},
-	}))
+	}})
 	got := updated.(Model)
 	if got.tracks[1].Title != "Zed" || got.tracks[1].Artist != "Artist" {
 		t.Fatalf("tag update not applied in place: %+v", got.tracks[1])
@@ -783,24 +785,24 @@ func TestTagUpdatesAdvanceProgressToTotalThenClear(t *testing.T) {
 		{Path: "b.mp3", Title: "b"},
 		{Path: "c.mp3", Title: "c"},
 	}
-	model := NewModel(tracks, nil, config.Defaults()).WithTagUpdates(make(chan []library.TagUpdate))
+	model := NewModel(tracks, nil, config.Defaults()).WithTagUpdates(make(chan []library.TagUpdate), nil)
 	updates := make([]library.TagUpdate, len(tracks))
 	for i := range tracks {
 		updates[i] = library.TagUpdate{Index: i, Track: library.Track{Path: tracks[i].Path, Title: "tagged"}}
 	}
-	updated, _ := model.Update(tagBatchMsg(updates))
+	updated, _ := model.Update(tagBatchMsg{gen: model.scanGen, updates: updates})
 	got := updated.(Model)
 	if got.tagScanned != len(tracks) {
 		t.Fatalf("tagScanned = %d, want %d", got.tagScanned, len(tracks))
 	}
-	updated, _ = got.Update(tagScanDoneMsg{})
+	updated, _ = got.Update(tagScanDoneMsg{gen: got.scanGen})
 	if updated.(Model).tagScanning {
 		t.Fatal("tagScanDoneMsg did not clear the scanning indicator")
 	}
 }
 
 func TestWithTagUpdatesEnablesScanning(t *testing.T) {
-	model := NewModel(nil, nil, config.Defaults()).WithTagUpdates(make(chan []library.TagUpdate))
+	model := NewModel(nil, nil, config.Defaults()).WithTagUpdates(make(chan []library.TagUpdate), nil)
 	if !model.tagScanning || model.tagUpdates == nil {
 		t.Fatal("WithTagUpdates did not enable scanning")
 	}
@@ -840,13 +842,215 @@ func TestCurrentTrackFallsBackWhenNothingLoaded(t *testing.T) {
 func TestWaitForTagsReportsBatchThenDone(t *testing.T) {
 	channel := make(chan []library.TagUpdate, 1)
 	channel <- []library.TagUpdate{{Index: 0, Track: library.Track{Path: "a"}}}
-	message := waitForTags(channel)()
-	if batch, ok := message.(tagBatchMsg); !ok || len(batch) != 1 {
-		t.Fatalf("waitForTags returned %T %+v, want one-item tagBatchMsg", message, message)
+	message := waitForTags(7, channel)()
+	batch, ok := message.(tagBatchMsg)
+	if !ok || len(batch.updates) != 1 || batch.gen != 7 {
+		t.Fatalf("waitForTags returned %T %+v, want one-item tagBatchMsg for gen 7", message, message)
 	}
 	close(channel)
-	if _, ok := waitForTags(channel)().(tagScanDoneMsg); !ok {
-		t.Fatal("closed tag stream did not report tagScanDoneMsg")
+	done, ok := waitForTags(7, channel)().(tagScanDoneMsg)
+	if !ok || done.gen != 7 {
+		t.Fatal("closed tag stream did not report tagScanDoneMsg for the same generation")
+	}
+}
+
+func TestCurrentTrackRejectsStaleIndex(t *testing.T) {
+	tracks := []library.Track{
+		{Path: "a.mp3", Title: "A"},
+		{Path: "b.mp3", Title: "B"},
+	}
+	model := NewModel(tracks, nil, config.Defaults())
+	// The status index is stale (0) but the loaded track is b: the path check
+	// must fall back to the engine's copy rather than render the wrong title.
+	model.status = player.Status{Index: 0, Count: 2, Track: library.Track{Path: "b.mp3", Title: "B"}}
+	if got := model.currentTrack(); got.Path != "b.mp3" || got.Title != "B" {
+		t.Fatalf("currentTrack = %+v, want the b path", got)
+	}
+}
+
+func TestLibraryMarksPlayingTrackByPathNotIndex(t *testing.T) {
+	tracks := []library.Track{
+		{Title: "First", Path: "/music/1.flac"},
+		{Title: "Second", Path: "/music/2.flac"},
+	}
+	model := NewModel(tracks, nil, config.Defaults())
+	model.status = player.Status{Track: tracks[1], Index: 0, Count: 2}
+	panel := ansi.Strip(model.libraryPanel(50, 30, model.palette()))
+	if !strings.Contains(panel, "▶ Second") || strings.Contains(panel, "▶ First") {
+		t.Fatalf("playing marker followed the stale index instead of the path:\n%s", panel)
+	}
+}
+
+func TestNextTrackTitleIsPathKeyed(t *testing.T) {
+	tracks := []library.Track{
+		{Title: "Current", Path: "a.flac"},
+		{Title: "Old Tag", Path: "b.flac"},
+	}
+	model := NewModel(tracks, nil, config.Defaults())
+	model.tracks[1].Title = "Fresh Tag"
+	model.status = player.Status{Count: 2, Track: tracks[0], NextTrack: tracks[1]}
+	if got := model.nextTrackTitle(); got != "Fresh Tag" {
+		t.Fatalf("nextTrackTitle = %q, want the tagged title for the upcoming path", got)
+	}
+}
+
+func TestRefreshVisibleKeepsCursorByPath(t *testing.T) {
+	tracks := []library.Track{
+		{Title: "A", Path: "a.flac"},
+		{Title: "B", Path: "b.flac"},
+	}
+	model := NewModel(tracks, nil, config.Defaults())
+	model.selected = 1 // B
+	model.tracks = []library.Track{
+		{Title: "B", Path: "b.flac"},
+		{Title: "A", Path: "a.flac"},
+	}
+	model.refreshVisibleKeeping("b.flac")
+	if got := model.tracks[model.visible[model.selected]].Path; got != "b.flac" {
+		t.Fatalf("cursor = %q, want b.flac", got)
+	}
+}
+
+func TestRescanResultStartsPendingSwapWithoutAdoptingList(t *testing.T) {
+	old := []library.Track{{Title: "Old", Path: "old.mp3"}}
+	model := NewModel(old, &player.Engine{}, config.Defaults())
+	model.scanGen = 1
+	updated, _ := model.Update(rescanResultMsg{gen: 1, paths: []string{"new-a.mp3", "new-b.mp3"}})
+	got := updated.(Model)
+	if len(got.tracks) != 1 || got.tracks[0].Path != "old.mp3" {
+		t.Fatalf("rescan adopted the new list before the engine ack: %+v", got.tracks)
+	}
+	if len(got.pendingTracks) != 2 || got.pendingRevision != 1 {
+		t.Fatalf("pending swap = %d tracks rev %d, want 2 rev 1", len(got.pendingTracks), got.pendingRevision)
+	}
+	if got.rescanning {
+		t.Fatal("rescan indicator stayed on after the walk completed")
+	}
+}
+
+func TestRescanFailureKeepsLibraryAndNotes(t *testing.T) {
+	old := []library.Track{{Title: "Old", Path: "old.mp3"}}
+	model := NewModel(old, &player.Engine{}, config.Defaults())
+	model.scanGen = 1
+	updated, _ := model.Update(rescanResultMsg{gen: 1, err: errors.New("permission denied")})
+	got := updated.(Model)
+	if got.notice == "" || len(got.pendingTracks) != 0 || got.tracks[0].Path != "old.mp3" {
+		t.Fatalf("failed rescan changed state: notice %q pending %d tracks %+v", got.notice, len(got.pendingTracks), got.tracks)
+	}
+}
+
+func TestRescanZeroTracksKeepsLibraryAndNotes(t *testing.T) {
+	old := []library.Track{{Title: "Old", Path: "old.mp3"}}
+	model := NewModel(old, &player.Engine{}, config.Defaults())
+	model.scanGen = 1
+	updated, _ := model.Update(rescanResultMsg{gen: 1})
+	got := updated.(Model)
+	if got.notice == "" || len(got.pendingTracks) != 0 || len(got.tracks) != 1 {
+		t.Fatalf("zero-track rescan = notice %q pending %d tracks %d", got.notice, len(got.pendingTracks), len(got.tracks))
+	}
+}
+
+func TestCommitRescanRequiresAckAndKeepsCursor(t *testing.T) {
+	old := []library.Track{
+		{Title: "A", Path: "a.mp3"},
+		{Title: "B", Path: "b.mp3"},
+		{Title: "C", Path: "c.mp3"},
+	}
+	model := NewModel(old, &player.Engine{}, config.Defaults())
+	model.selected = 2 // C
+	model.trackRevision = 1
+	model.pendingTracks = []library.Track{
+		{Title: "C", Path: "c.mp3"},
+		{Title: "A", Path: "a.mp3"},
+		{Title: "B", Path: "b.mp3"},
+	}
+	model.pendingPaths = nil // mechanics test: no tag goroutines need draining
+	model.pendingRevision = 2
+
+	// A status from before the swap (echoing the previously committed revision)
+	// must not adopt the pending list.
+	updated, _ := model.Update(statusMsg(player.Status{Revision: 1, Count: 3, Index: 0, Track: library.Track{Path: "c.mp3"}}))
+	if got := updated.(Model); got.trackRevision != 1 || got.pendingTracks == nil {
+		t.Fatal("a stale revision committed the pending swap")
+	}
+
+	// The matching revision commits and keeps the cursor on C by path.
+	updated, _ = updated.(Model).Update(statusMsg(player.Status{Revision: 2, Count: 3, Index: 0, Track: library.Track{Path: "c.mp3"}}))
+	got := updated.(Model)
+	if got.trackRevision != 2 || got.pendingTracks != nil {
+		t.Fatalf("matching revision did not commit: revision %d pending %d", got.trackRevision, len(got.pendingTracks))
+	}
+	if selected := got.tracks[got.visible[got.selected]].Path; selected != "c.mp3" {
+		t.Fatalf("cursor moved off C after commit: %q", selected)
+	}
+}
+
+func TestStaleTagBatchIsDroppedAndNotRearmed(t *testing.T) {
+	tracks := []library.Track{{Path: "a", Title: "a"}, {Path: "b", Title: "b"}}
+	model := NewModel(tracks, nil, config.Defaults()).WithTagUpdates(make(chan []library.TagUpdate), nil)
+
+	updated, command := model.Update(tagBatchMsg{gen: 0, updates: []library.TagUpdate{{Index: 0, Track: library.Track{Path: "a", Title: "OLD"}}}})
+	got := updated.(Model)
+	if got.tracks[0].Title != "a" || got.tagScanned != 0 {
+		t.Fatalf("stale batch was applied: %+v", got.tracks[0])
+	}
+	if command != nil {
+		t.Fatal("stale batch re-armed the old tag channel")
+	}
+
+	updated, command = got.Update(tagBatchMsg{gen: got.scanGen, updates: []library.TagUpdate{{Index: 0, Track: library.Track{Path: "a", Title: "NEW"}}}})
+	got = updated.(Model)
+	if got.tracks[0].Title != "NEW" || got.tagScanned != 1 || command == nil {
+		t.Fatalf("current batch not applied/re-armed: title %q scanned %d cmd %v", got.tracks[0].Title, got.tagScanned, command)
+	}
+}
+
+func TestRescanKeyStartsCancellableWalk(t *testing.T) {
+	model := NewModel([]library.Track{{Path: "a"}}, &player.Engine{}, config.Defaults())
+	updated, command := model.Update(tea.KeyMsg{Type: tea.KeyF5})
+	got := updated.(Model)
+	if command == nil || !got.rescanning {
+		t.Fatalf("rescan key did not start a walk: cmd %v rescanning %t", command, got.rescanning)
+	}
+	if got.scanGen == 0 || got.scanCancel == nil {
+		t.Fatal("rescan key did not establish a cancellable walk generation")
+	}
+	got.CancelScan()
+}
+
+func TestSecondRescanSupersedesFirstWalk(t *testing.T) {
+	model := NewModel([]library.Track{{Path: "a"}}, &player.Engine{}, config.Defaults())
+	updated, first := model.Update(tea.KeyMsg{Type: tea.KeyF5})
+	model = updated.(Model)
+	firstGen := model.scanGen
+	if first == nil {
+		t.Fatal("first rescan produced no walk command")
+	}
+	updated, second := model.Update(tea.KeyMsg{Type: tea.KeyF5})
+	model = updated.(Model)
+	if second == nil || model.scanGen == firstGen {
+		t.Fatalf("second rescan did not supersede the first (gen %d -> %d)", firstGen, model.scanGen)
+	}
+	// The superseded walk's result is dropped by generation.
+	updated, _ = model.Update(rescanResultMsg{gen: firstGen, paths: []string{"stale.mp3"}})
+	if got := updated.(Model); got.pendingTracks != nil {
+		t.Fatal("a superseded walk's result was adopted")
+	}
+	model.CancelScan()
+}
+
+func TestCancelScanCancelsInFlightWalk(t *testing.T) {
+	model := NewModel([]library.Track{{Path: "a"}}, &player.Engine{}, config.Defaults())
+	walk := model.startRescan()
+	model.CancelScan()
+
+	message := walk()
+	result, ok := message.(rescanResultMsg)
+	if !ok {
+		t.Fatalf("walk command returned %T, want rescanResultMsg", message)
+	}
+	if !errors.Is(result.err, context.Canceled) {
+		t.Fatalf("cancelled walk error = %v, want context.Canceled", result.err)
 	}
 }
 

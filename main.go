@@ -70,10 +70,17 @@ func main() {
 	tagUpdates := library.ReadTags(scanCtx, paths, runtime.NumCPU())
 
 	program := tea.NewProgram(
-		ui.NewModel(tracks, engine, cfg).WithTagUpdates(tagUpdates),
+		ui.NewModel(tracks, engine, cfg).WithTagUpdates(tagUpdates, stopScan),
 		tea.WithAltScreen(),
 	)
-	_, runErr := program.Run()
+	finalModel, runErr := program.Run()
+
+	// A rescan replaces the initial scan context with its own; cancel whatever
+	// walk/tag scan is current so no scan goroutine outlives the TUI. (The
+	// initial context is also cancelled by the deferred stopScan.)
+	if model, ok := finalModel.(ui.Model); ok {
+		model.CancelScan()
+	}
 
 	// Persist on every exit path: the quit key, Ctrl+C, and SIGINT/SIGTERM
 	// (Bubble Tea turns those into a clean Run return or ErrInterrupted). This

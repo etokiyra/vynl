@@ -1,10 +1,12 @@
 package ui
 
 import (
+	"context"
 	"fmt"
 	"math"
 	"os"
 	"path/filepath"
+	"runtime"
 	"sort"
 	"strconv"
 	"strings"
@@ -28,9 +30,23 @@ type statusMsg player.Status
 type trackDetailsMsg trackDetails
 
 // tagBatchMsg carries one batch of incremental tag metadata; tagScanDoneMsg is
-// emitted once when the scan stream closes.
-type tagBatchMsg []library.TagUpdate
-type tagScanDoneMsg struct{}
+// emitted once when the scan stream closes. Both carry the scan generation so a
+// batch from a superseded scan (e.g. one already queued when a rescan starts)
+// can be dropped instead of being applied to the new track list.
+type tagBatchMsg struct {
+	gen     int
+	updates []library.TagUpdate
+}
+type tagScanDoneMsg struct{ gen int }
+
+// rescanResultMsg is the outcome of the off-thread directory walk. gen is the
+// walk generation; the walk can be cancelled (its context), and a superseded
+// walk's result is dropped by generation.
+type rescanResultMsg struct {
+	gen   int
+	paths []string
+	err   error
+}
 
 // trackSort selects how the library list is ordered.
 type trackSort int
@@ -96,12 +112,32 @@ type Model struct {
 	showHelp       bool
 	sortKey        trackSort
 
-	// tagUpdates is the asynchronous tag scan stream, if one is running.
-	// tagScanning drives the "SCANNING" indicator and tagScanned is its count.
-	// Both live only on the Bubble Tea event loop.
+	// tagUpdates is the asynchronous tag scan stream, if one is running, and
+	// scanCancel cancels its context (covering both the walk and the tag
+	// read). scanGen is the generation stamped on messages from that stream so
+	// a superseded scan's late batch is ignored. All of this lives only on the
+	// Bubble Tea event loop.
 	tagUpdates  <-chan []library.TagUpdate
+	scanCancel  context.CancelFunc
+	scanGen     int
 	tagScanning bool
 	tagScanned  int
+
+	// trackRevision is the engine track-list revision that m.tracks is known to
+	// match. A rescan's replacement is held in pending* and only adopted (with
+	// tag streaming restarted) once a Status echoes pendingRevision, so the UI
+	// never trusts indices against a list the engine has not applied. rescanSeq
+	// is a monotonic counter (never reset, even if a SetTracks is dropped) so a
+	// stale ack from a superseded swap can never match a later pending one.
+	// notice carries a one-line failure message (e.g. a rescan that found
+	// nothing).
+	trackRevision   int
+	rescanSeq       int
+	pendingTracks   []library.Track
+	pendingPaths    []string
+	pendingRevision int
+	rescanning      bool
+	notice          string
 }
 
 func NewModel(tracks []library.Track, engine *player.Engine, cfg config.Config) Model {
@@ -114,11 +150,14 @@ func NewModel(tracks []library.Track, engine *player.Engine, cfg config.Config) 
 	return m
 }
 
-// WithTagUpdates attaches an incremental tag stream. The UI applies batches as
-// they arrive and shows a scanning indicator until the stream closes. It is a
-// separate method (not a NewModel parameter) so existing callers are unaffected.
-func (m Model) WithTagUpdates(updates <-chan []library.TagUpdate) Model {
+// WithTagUpdates attaches the initial incremental tag stream and the cancel for
+// its context. The model cancels that context when the user starts a rescan and
+// again on exit (see CancelScan). It is a separate method (not a NewModel
+// parameter) so existing callers are unaffected.
+func (m Model) WithTagUpdates(updates <-chan []library.TagUpdate, cancel context.CancelFunc) Model {
 	m.tagUpdates = updates
+	m.scanCancel = cancel
+	m.scanGen = 1
 	m.tagScanning = updates != nil
 	return m
 }
@@ -129,9 +168,19 @@ func (m Model) Init() tea.Cmd {
 		commands = append(commands, waitForStatus(m.engine.Updates()))
 	}
 	if m.tagUpdates != nil {
-		commands = append(commands, waitForTags(m.tagUpdates))
+		commands = append(commands, waitForTags(m.scanGen, m.tagUpdates))
 	}
 	return tea.Batch(commands...)
+}
+
+// CancelScan cancels the current walk/tag scan context, if any. main calls it
+// after the TUI exits so the latest rescan's walk and tag reader stop; the
+// Bubble Tea command goroutines then return promptly and their late messages
+// are discarded (Send respects the program context).
+func (m Model) CancelScan() {
+	if m.scanCancel != nil {
+		m.scanCancel()
+	}
 }
 
 func (m Model) Update(message tea.Msg) (tea.Model, tea.Cmd) {
@@ -168,6 +217,13 @@ func (m Model) Update(message tea.Msg) (tea.Model, tea.Cmd) {
 		wasPlaying := m.status.Playing
 		m.status = player.Status(msg)
 		m.statusAt = time.Now()
+		commands := []tea.Cmd{waitForStatus(m.engine.Updates())}
+		// The engine echoes the track-list revision it has applied. Only when it
+		// matches our pending swap do we adopt the new list, so indices are
+		// never used against a list the engine has not switched to.
+		if m.pendingTracks != nil && m.status.Revision == m.pendingRevision {
+			commands = append(commands, m.commitRescan()...)
+		}
 		m.rmsTarget = 0
 		m.spectrumTarget = [player.SpectrumBands]float64{}
 		if m.status.Playing {
@@ -179,7 +235,6 @@ func (m Model) Update(message tea.Msg) (tea.Model, tea.Cmd) {
 			m.channelTarget = [2]float64{}
 			m.bassTarget = 0
 		}
-		commands := []tea.Cmd{waitForStatus(m.engine.Updates())}
 		track := m.currentTrack()
 		if m.loaded.path != track.Path {
 			// Reserve the path so repeated status updates do not queue duplicate
@@ -199,15 +254,45 @@ func (m Model) Update(message tea.Msg) (tea.Model, tea.Cmd) {
 			m.loaded = details
 		}
 	case tagBatchMsg:
-		m.applyTagUpdates([]library.TagUpdate(msg))
+		if msg.gen != m.scanGen {
+			// A batch from a superseded scan that was already queued when the
+			// rescan bumped the generation. Drop it and do not re-arm the old
+			// channel.
+			break
+		}
+		m.applyTagUpdates(msg.updates)
 		if m.tagUpdates != nil {
-			return m, waitForTags(m.tagUpdates)
+			return m, waitForTags(m.scanGen, m.tagUpdates)
 		}
 	case tagScanDoneMsg:
+		if msg.gen != m.scanGen {
+			break
+		}
 		// The stream is exhausted; clear the indicator regardless of the count
 		// so a late or missing final batch can never look stuck.
 		m.tagScanning = false
 		m.tagUpdates = nil
+	case rescanResultMsg:
+		if msg.gen != m.scanGen {
+			break
+		}
+		m.rescanning = false
+		switch {
+		case msg.err != nil:
+			m.notice = "Rescan failed: " + msg.err.Error()
+		case len(msg.paths) == 0:
+			m.notice = "Rescan found no supported tracks; keeping the current library"
+		default:
+			m.pendingTracks = library.FallbackTracks(msg.paths)
+			m.pendingPaths = msg.paths
+			m.rescanSeq++
+			m.pendingRevision = m.rescanSeq
+			if m.engine != nil {
+				m.engine.Send(player.Command{
+					Action: player.SetTracks, Tracks: m.pendingTracks, Revision: m.pendingRevision,
+				})
+			}
+		}
 	case tea.KeyMsg:
 		return m.updateKey(msg)
 	}
@@ -321,6 +406,8 @@ func (m Model) updateKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	case key == keys.Sort:
 		m.sortKey = m.sortKey.next()
 		m.refreshVisible()
+	case key == keys.Rescan:
+		return m, m.startRescan()
 	case key == "1", key == "2", key == "3":
 		m.eqBand = int(key[0] - '1')
 	case key == "-":
@@ -338,6 +425,65 @@ func (m Model) updateKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		}
 	}
 	return m, nil
+}
+
+// startRescan cancels any in-flight walk/tag scan and kicks off a fresh
+// directory walk as a Bubble Tea command, so a large tree cannot freeze the
+// update loop. Its result is gated by scanGen, so pressing rescan again (or
+// quitting) supersedes rather than interleaves: the previous walk's context is
+// cancelled and any late result is dropped.
+func (m *Model) startRescan() tea.Cmd {
+	if m.scanCancel != nil {
+		m.scanCancel()
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	m.scanCancel = cancel
+	m.scanGen++
+	m.rescanning = true
+	m.tagScanning = false
+	m.notice = ""
+	root := m.config.MusicDir
+	gen := m.scanGen
+	return rescanWalk(ctx, gen, root)
+}
+
+// commitRescan adopts the pending track list, cancels the previous scan, starts
+// a fresh tag scan for the new list, and returns the command that reads it.
+// Callers must have first observed a Status whose Revision equals
+// pendingRevision, which is what guarantees the engine and UI lists agree.
+func (m *Model) commitRescan() []tea.Cmd {
+	if m.scanCancel != nil {
+		m.scanCancel()
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	m.scanCancel = cancel
+	m.scanGen++
+
+	selectedPath := m.currentSelectedPath()
+	m.tracks = m.pendingTracks
+	m.trackRevision = m.pendingRevision
+	paths := m.pendingPaths
+	m.pendingTracks = nil
+	m.pendingPaths = nil
+	m.pendingRevision = 0
+	m.rescanning = false
+	m.notice = ""
+	m.tagScanned = 0
+	m.refreshVisibleKeeping(selectedPath)
+
+	updates := library.ReadTags(ctx, paths, runtime.NumCPU())
+	m.tagUpdates = updates
+	m.tagScanning = updates != nil
+	return []tea.Cmd{waitForTags(m.scanGen, updates)}
+}
+
+// rescanWalk performs the metadata-only directory walk off the update loop. The
+// context lets a superseding rescan (or exit) abort a slow walk.
+func rescanWalk(ctx context.Context, gen int, root string) tea.Cmd {
+	return func() tea.Msg {
+		paths, err := library.ScanPathsContext(ctx, root)
+		return rescanResultMsg{gen: gen, paths: paths, err: err}
+	}
 }
 
 func (m Model) View() string {
@@ -415,6 +561,7 @@ func (m Model) helpLine(p palette) string {
 			keyLabel(keys.Mute) + " mute",
 			keyLabel(keys.Shuffle) + " shuffle",
 			keyLabel(keys.Repeat) + " repeat",
+			keyLabel(keys.Rescan) + " rescan",
 			"TAB library",
 			"? help",
 			keyLabel(keys.Quit) + " quit",
@@ -422,7 +569,8 @@ func (m Model) helpLine(p palette) string {
 		return p.muted.Render(strings.Join(parts, "  "))
 	}
 	return p.muted.Render("↑/↓ browse   ENTER load   " + keyLabel(keys.Search) +
-		" find   " + keyLabel(keys.Sort) + " sort   " + keyLabel(keys.Toggle) + " play   " +
+		" find   " + keyLabel(keys.Sort) + " sort   " + keyLabel(keys.Rescan) + " rescan   " +
+		keyLabel(keys.Toggle) + " play   " +
 		keyLabel(keys.Next) + "/" + keyLabel(keys.Prev) + " track   TAB deck   ? help   " + keyLabel(keys.Quit) + " quit")
 }
 
@@ -474,6 +622,7 @@ func (m Model) helpEntries() []helpEntry {
 		{keyLabel(keys.Shuffle), "Toggle shuffle"},
 		{keyLabel(keys.Repeat), "Cycle repeat off/all/one"},
 		{keyLabel(keys.Sort), "Cycle library sort order"},
+		{keyLabel(keys.Rescan), "Rescan library"},
 		{"1 2 3", "Select EQ band"},
 		{"+ -", "Adjust selected EQ band"},
 		{"TAB", "Switch focus"},
@@ -655,8 +804,14 @@ func (m Model) libraryPanel(width, height int, p palette) string {
 		end = start + maxTracks
 	}
 	header := fmt.Sprintf("%d/%d TRACKS  %s", len(m.visible), len(m.tracks), m.sortKey.label())
+	if m.rescanning {
+		header += "  RESCANNING"
+	}
 	if m.tagScanning {
 		header += fmt.Sprintf("  SCANNING %d/%d", min(m.tagScanned, len(m.tracks)), len(m.tracks))
+	}
+	if m.notice != "" {
+		header += "  " + m.notice
 	}
 	if query := strings.TrimSpace(m.search); query != "" {
 		header += "  FILTER: " + query
@@ -679,7 +834,7 @@ func (m Model) libraryPanel(width, height int, p palette) string {
 			artist = filepathBase(track.Path)
 		}
 		marker := "  "
-		if m.status.Count > 0 && trackIndex == m.status.Index {
+		if m.status.Track.Path != "" && track.Path == m.status.Track.Path {
 			marker = "▶ "
 		}
 		switch {
@@ -749,11 +904,27 @@ func (m *Model) moveSelection(delta int) {
 }
 
 func (m *Model) refreshVisible() {
-	query := strings.ToLower(strings.TrimSpace(m.search))
-	selectedTrack := -1
+	m.refreshVisibleKeeping(m.currentSelectedPath())
+}
+
+// currentSelectedPath returns the path of the track under the cursor, or "" if
+// there is none. Paths, not indices, are the stable identity across a rescan:
+// the track list is replaced, so an old index can point at a different track.
+func (m *Model) currentSelectedPath() string {
 	if m.selected >= 0 && m.selected < len(m.visible) {
-		selectedTrack = m.visible[m.selected]
+		if index := m.visible[m.selected]; index >= 0 && index < len(m.tracks) {
+			return m.tracks[index].Path
+		}
 	}
+	return ""
+}
+
+// refreshVisibleKeeping rebuilds the filtered/sorted view and restores the
+// cursor to the track with the given path (clamping when it is gone). Tag
+// updates and a rescan both reorder or replace the list, so the cursor is keyed
+// by path rather than by a position that would go stale.
+func (m *Model) refreshVisibleKeeping(selectedPath string) {
+	query := strings.ToLower(strings.TrimSpace(m.search))
 
 	type result struct{ index, score int }
 	results := make([]result, 0, len(m.tracks))
@@ -775,12 +946,12 @@ func (m *Model) refreshVisible() {
 		m.visible = append(m.visible, result.index)
 	}
 
-	// Keep the cursor on the same track where possible when the list reorders
-	// or is filtered.
-	if selectedTrack >= 0 {
+	// Keep the cursor on the same track where possible when the list reorders,
+	// is filtered, or is replaced by a rescan.
+	if selectedPath != "" {
 		m.selected = 0
 		for position, index := range m.visible {
-			if index == selectedTrack {
+			if m.tracks[index].Path == selectedPath {
 				m.selected = position
 				break
 			}
@@ -817,7 +988,11 @@ func (m Model) currentTrack() library.Track {
 	if m.status.Track.Path == "" {
 		return m.status.Track
 	}
-	if m.status.Index >= 0 && m.status.Index < len(m.tracks) {
+	// The index is only valid while the UI's list is the one the engine's
+	// status was produced against; verify by path and fall back to the engine's
+	// own copy otherwise, so a rescan can never render a wrong title.
+	if m.status.Index >= 0 && m.status.Index < len(m.tracks) &&
+		m.tracks[m.status.Index].Path == m.status.Track.Path {
 		return m.tracks[m.status.Index]
 	}
 	return m.status.Track
@@ -890,16 +1065,37 @@ func (m Model) playbackPosition() float64 {
 }
 
 // nextTrackTitle returns the title of the track the engine will play next, or
-// "" when there is nothing meaningful to show.
+// "" when there is nothing meaningful to show. It is driven by the status's
+// NextTrack (path-keyed), not by a raw index, so a just-committed rescan cannot
+// show the wrong upcoming track.
 func (m Model) nextTrackTitle() string {
-	if m.status.Count <= 1 || m.status.NextIndex < 0 || m.status.NextIndex >= len(m.tracks) {
+	if m.status.Count <= 1 {
 		return ""
 	}
-	track := m.tracks[m.status.NextIndex]
+	track := m.status.NextTrack
+	if index := m.indexOfPath(track.Path); index >= 0 {
+		track = m.tracks[index]
+	}
+	if track.Path == "" {
+		return ""
+	}
 	if track.Title != "" {
 		return track.Title
 	}
 	return filepathBase(track.Path)
+}
+
+// indexOfPath returns the position of a path in the UI's track list, or -1.
+func (m Model) indexOfPath(path string) int {
+	if path == "" {
+		return -1
+	}
+	for index, track := range m.tracks {
+		if track.Path == path {
+			return index
+		}
+	}
+	return -1
 }
 
 func (m Model) visualRMS() float64 {
@@ -1423,12 +1619,12 @@ func waitForStatus(updates <-chan player.Status) tea.Cmd {
 	return func() tea.Msg { return statusMsg(<-updates) }
 }
 
-func waitForTags(updates <-chan []library.TagUpdate) tea.Cmd {
+func waitForTags(gen int, updates <-chan []library.TagUpdate) tea.Cmd {
 	return func() tea.Msg {
 		batch, ok := <-updates
 		if !ok {
-			return tagScanDoneMsg{}
+			return tagScanDoneMsg{gen: gen}
 		}
-		return tagBatchMsg(batch)
+		return tagBatchMsg{gen: gen, updates: batch}
 	}
 }

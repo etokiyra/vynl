@@ -2,6 +2,7 @@ package library
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -37,6 +38,25 @@ func TestScanPathsFiltersAndOrdersFiles(t *testing.T) {
 		if paths[i] != want[i] {
 			t.Fatalf("path %d = %q, want %q", i, paths[i], want[i])
 		}
+	}
+}
+
+func TestScanPathsContextCancellationStopsWalk(t *testing.T) {
+	root := t.TempDir()
+	for _, name := range []string{"a.mp3", "b.flac", "c.wav"} {
+		if err := writeFile(filepath.Join(root, name), []byte("x")); err != nil {
+			t.Fatal(err)
+		}
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	paths, err := ScanPathsContext(ctx, root)
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("cancelled ScanPathsContext error = %v, want context.Canceled", err)
+	}
+	if paths != nil {
+		t.Fatalf("cancelled ScanPathsContext returned %v, want no paths", paths)
 	}
 }
 

@@ -42,8 +42,24 @@ type TagUpdate struct {
 // the cheap, synchronous phase of a scan. Unreadable descendants are skipped;
 // an unreadable root is returned as an error.
 func ScanPaths(root string) ([]string, error) {
+	return ScanPathsContext(context.Background(), root)
+}
+
+// ScanPathsContext is ScanPaths with cancellation. It returns ctx.Err() if ctx
+// is cancelled before the walk finishes, which lets a rescan (or exit) abort an
+// in-flight walk instead of leaking a goroutine until a huge tree is walked.
+// A nil ctx is treated as a background context.
+func ScanPathsContext(ctx context.Context, root string) ([]string, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	var paths []string
 	err := filepath.WalkDir(root, func(path string, entry os.DirEntry, walkErr error) error {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		default:
+		}
 		if walkErr != nil {
 			// One unreadable folder should not make the whole library
 			// unscannable: skip the entry and keep walking. A failure to read
@@ -120,6 +136,11 @@ func ReadTags(ctx context.Context, paths []string, workers int) <-chan []TagUpda
 		go func() {
 			defer group.Done()
 			for {
+				select {
+				case <-ctx.Done():
+					return
+				default:
+				}
 				index := int(next.Add(1)) - 1
 				if index >= len(paths) {
 					return
@@ -139,7 +160,13 @@ func ReadTags(ctx context.Context, paths []string, workers int) <-chan []TagUpda
 	}()
 
 	go func() {
-		defer close(out)
+		// Wait for every worker before closing out even on the cancellation
+		// path: the channel closing is the documented "no goroutine leaked"
+		// signal, so it must never precede worker exit.
+		defer func() {
+			group.Wait()
+			close(out)
+		}()
 		batch := make([]TagUpdate, 0, maxTagBatch)
 		flush := func() bool {
 			if len(batch) == 0 {

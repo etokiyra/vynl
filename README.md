@@ -47,7 +47,10 @@ transparent terminals like kitty, foot, or Alacritty.
   off / all / one, and mute, restart, or seek from the keyboard
 - 📚 **Local library browser** — scans a folder for supported formats, reads
   tags off the UI thread (so startup is not blocked), fuzzy search, sortable
-  browsing, and a preview of the next track
+  browsing, a preview of the next track, and rescan without restarting
+- 🔄 **Rescan library** — `F5` re-walks the music folder and reloads the track
+  list in place (the currently playing track keeps playing if it is still
+  present), streaming the new list's tags in through the same async path
 - 🔊 **Stereo L/R level meters** and live track metadata (format, bitrate,
   sample rate, file size)
 - ⌨️ **Discoverable keymap** — context-sensitive footer hints plus a full-screen
@@ -118,6 +121,7 @@ vynl -config /path/to/config.toml
 | `Tab`         | Switch focus: library ↔ deck     |
 | `/`           | Search library                   |
 | `O`           | Cycle sort: path → title → artist → album |
+| `F5`          | Rescan the music folder                   |
 | `?`           | Show the full keybinding help    |
 | `Ctrl+C`      | Quit (always, even while searching) |
 | `Q`           | Quit                              |
@@ -164,6 +168,7 @@ vinyl         = "v"
 shuffle       = "z"
 repeat        = "c"
 sort          = "o"
+rescan        = "f5"
 search        = "/"
 quit          = "q"
 ```
@@ -204,7 +209,8 @@ VYNL is built around a few core pieces:
   `order.go` owns shuffle/repeat, and `spectrum.go` is the FFT analyzer.
 - **`library/`** — walks the configured music directory (fast, metadata only)
   and reads tags in parallel off the UI thread, streaming the track list in as
-  results arrive.
+  results arrive. A rescan (`F5`) re-walks in the background and streams the new
+  list's tags the same way.
 - **`ui/`** — the Bubble Tea model driving the deck, visualizer, vinyl
   animation, and library browser, all synced to a single tick loop.
 - **`config/`** — TOML config loading with sensible defaults when no config
@@ -233,9 +239,13 @@ command/status channels.
   `state.toml` and restored on the next run; a corrupt state file falls back to
   defaults with a warning. The current track and playback position are not
   restored
-- The directory walk runs before the UI appears (metadata only, no file opens);
-  tag reading is off the UI thread, so the list shows filename titles first and
-  fills in metadata live with a `SCANNING` indicator
+- The startup directory walk runs before the UI appears (metadata only, no file
+  opens); tag reading is off the UI thread, so the list shows filename titles
+  first and fills in metadata live with a `SCANNING` indicator. `F5` rescans
+  with the walk off the UI thread and the tags streaming through the same async
+  path. A rescan replaces the whole track list at once (it is not incremental);
+  if it finds no files, or the walk fails, the current library and playback are
+  kept and a notice is shown
 - Unreadable folders inside the music directory are skipped during the scan;
   the rest of the library still loads
 - Extreme speed/pitch settings can introduce minor artifacts on
@@ -260,7 +270,9 @@ order.
 - [x] **Async library scan** — tag reading runs off the UI thread and streams
       into the list with a `SCANNING` progress indicator, so startup is not
       blocked by metadata parsing
-- [ ] **Rescan library** — reload the track list without restarting
+- [x] **Rescan library** — `F5` re-walks the music folder and reloads the track
+      list without restarting, keeping the current track playing and streaming
+      the new list's tags in asynchronously
 - [ ] **Auto-skip corrupt tracks** — advance past files that fail to decode
       instead of stalling
 

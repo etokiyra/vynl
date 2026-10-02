@@ -33,6 +33,7 @@ func TestDefaultsBindPlaybackControlsDistinctly(t *testing.T) {
 		"speed_down": keys.SpeedDown, "speed_up": keys.SpeedUp, "pitch_down": keys.PitchDown,
 		"pitch_up": keys.PitchUp, "reset": keys.Reset, "vinyl": keys.Vinyl, "shuffle": keys.Shuffle,
 		"repeat": keys.Repeat, "sort": keys.Sort, "search": keys.Search, "quit": keys.Quit,
+		"rescan": keys.Rescan,
 	}
 	seen := map[string]string{}
 	for action, key := range bound {

@@ -40,19 +40,31 @@ const (
 	Repeat  Action = "repeat"
 	EQ      Action = "eq"
 	Select  Action = "select"
+	// SetTracks replaces the engine's complete track list in one shot. It is
+	// the only mutation of the list after construction; the replacement is
+	// carried on the Command (there is no append/incremental path), and
+	// Revision is echoed in every subsequent Status so the UI can tell when the
+	// swap has landed and only then trust index-based fields.
+	SetTracks Action = "settracks"
 )
 
 type Command struct {
 	Action Action
 	Value  float64
 	Band   int
+	// Tracks is the complete replacement list for SetTracks; Revision is a
+	// caller-assigned generation token echoed back in Status.
+	Tracks   []library.Track
+	Revision int
 }
 
 type Status struct {
 	Track      library.Track
+	NextTrack  library.Track
 	Index      int
 	NextIndex  int
 	Count      int
+	Revision   int
 	Playing    bool
 	Loading    bool
 	Buffering  bool
@@ -86,6 +98,7 @@ type Engine struct {
 	decodeDone   chan struct{}
 	index        int
 	order        playOrder
+	revision     int
 	speed        float64
 	pitch        float64
 	volume       float64
@@ -169,11 +182,19 @@ func (e *Engine) applyInitial(initial InitialState) {
 	if e.speed == 0 {
 		e.speed = 1
 	}
+	e.rebuildOrder(0)
+	e.updatePersist()
+}
+
+// rebuildOrder rebuilds the play order for the current track list, honoring the
+// shuffle setting, and points the order at index. It is used when the list size
+// changes (startup and rescan); it never touches the decode/transport state.
+func (e *Engine) rebuildOrder(index int) {
 	e.order = newPlayOrder(len(e.tracks))
 	if e.shuffle {
 		e.order.shuffle()
 	}
-	e.updatePersist()
+	e.order.setCurrent(index)
 }
 
 // updatePersist refreshes the cross-goroutine snapshot. Called on the engine
@@ -269,6 +290,8 @@ func (e *Engine) handle(command Command) {
 		if index >= 0 && index < len(e.tracks) {
 			e.selectTrack(index, true)
 		}
+	case SetTracks:
+		e.replaceTracks(command.Tracks, command.Revision)
 	case Seek:
 		if e.stream != nil {
 			speaker.Lock()
@@ -320,6 +343,60 @@ func (e *Engine) handle(command Command) {
 		}
 	}
 	e.publish()
+}
+
+// planTrackSwap decides how a replacement track list affects the loaded track.
+// It matches by path (the stable identity across a rescan); when the current
+// path is empty or absent it returns (0, false), meaning playback should stop
+// and the deck should settle on the first track.
+func planTrackSwap(currentPath string, tracks []library.Track) (index int, keep bool) {
+	if currentPath == "" {
+		return 0, false
+	}
+	for i, track := range tracks {
+		if track.Path == currentPath {
+			return i, true
+		}
+	}
+	return 0, false
+}
+
+// replaceTracks swaps in a complete new track list. It is the engine's only
+// list mutation and runs on the engine goroutine via handle(SetTracks).
+//
+// If the currently loaded track is still present (by path) it keeps playing
+// untouched, so the swap never touches the audio path; only the index and the
+// play order change. If it is gone, playback stops and the deck parks on the
+// first track paused rather than silently jumping into a different song.
+func (e *Engine) replaceTracks(tracks []library.Track, revision int) {
+	if len(tracks) == 0 {
+		// The engine contract is a non-empty list; a rescan that finds nothing
+		// keeps the current library rather than leaving the engine in a state
+		// selectTrack/publish assume cannot happen.
+		return
+	}
+	currentPath := ""
+	if e.index >= 0 && e.index < len(e.tracks) {
+		currentPath = e.tracks[e.index].Path
+	}
+	index, keep := planTrackSwap(currentPath, tracks)
+	e.tracks = tracks
+	e.revision = revision
+	if keep {
+		e.rebuildOrder(index)
+		e.index = index
+		e.publish()
+		return
+	}
+	if e.control == nil {
+		// Nothing is loaded yet (a rescan before the initial Select runs):
+		// there is no playback to stop, so just repoint the deck.
+		e.rebuildOrder(0)
+		e.index = 0
+		e.publish()
+		return
+	}
+	e.selectTrack(0, false)
 }
 
 func (e *Engine) selectTrack(index int, autoplay bool) {
@@ -449,14 +526,16 @@ func (e *Engine) publish() {
 		Index: e.index, Count: len(e.tracks), Playing: e.playing,
 		Loading: e.loading, Speed: e.speed, Pitch: e.pitch, Volume: e.volume,
 		Muted: e.muted, Vinyl: e.vinyl, Shuffle: e.shuffle, Repeat: e.repeat,
-		EQ: e.eq, Err: e.errText,
+		EQ: e.eq, Err: e.errText, Revision: e.revision,
 	}
 	if len(e.tracks) > 0 {
 		status.Track = e.tracks[e.index]
 		if len(e.tracks) > 1 {
 			status.NextIndex, _ = e.order.peek(1)
+			status.NextTrack = e.tracks[status.NextIndex]
 		} else {
 			status.NextIndex = e.index
+			status.NextTrack = e.tracks[e.index]
 		}
 	}
 	if e.stream != nil {

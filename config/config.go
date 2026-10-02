@@ -44,6 +44,7 @@ type Keybindings struct {
 	Repeat      string `toml:"repeat"`
 	Sort        string `toml:"sort"`
 	Search      string `toml:"search"`
+	Rescan      string `toml:"rescan"`
 	Quit        string `toml:"quit"`
 }
 
@@ -62,7 +63,7 @@ func Defaults() Config {
 			Toggle: " ", Stop: "s", Next: "n", Prev: "p", SeekBack: "left", SeekForward: "right",
 			Restart: "0", VolumeDown: "down", VolumeUp: "up", Mute: "m", SpeedDown: "[", SpeedUp: "]",
 			PitchDown: "{", PitchUp: "}", Reset: "r", Vinyl: "v", Shuffle: "z", Repeat: "c",
-			Sort: "o", Search: "/", Quit: "q",
+			Sort: "o", Search: "/", Rescan: "f5", Quit: "q",
 		},
 	}
 }
