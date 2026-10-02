@@ -73,6 +73,7 @@ type Status struct {
 	Speed      float64
 	Pitch      float64
 	Volume     float64
+	SampleRate int
 	Muted      bool
 	Vinyl      bool
 	Shuffle    bool
@@ -84,6 +85,10 @@ type Status struct {
 	BassRMS    float64
 	Spectrum   [SpectrumBands]float64
 	Err        string
+	// Skipped is the number of unplayable tracks auto-skipped to reach the
+	// loaded one (0 when the loaded track opened cleanly). It is informational:
+	// the deck surfaces it so a silent jump over a corrupt file is explained.
+	Skipped int
 }
 
 type Engine struct {
@@ -109,6 +114,8 @@ type Engine struct {
 	eq           [3]float64
 	playing      bool
 	errText      string
+	skipped      int
+	sampleRate   int
 	analyzer     *spectrumAnalyzer
 	waveform     [analyzerSize]float32
 	spectrum     [SpectrumBands]float64
@@ -399,7 +406,46 @@ func (e *Engine) replaceTracks(tracks []library.Track, revision int) {
 	e.selectTrack(0, false)
 }
 
+// selectTrack loads the track at index and, when autoplay is set, automatically
+// skips forward over any track that fails to open or decode instead of parking
+// on it. Explicit selection (the UI's Enter/Select), Next/Prev, start-of-run,
+// and end-of-track advance all route through here, so a single unplayable file
+// can never stall playback.
+//
+// At most len(tracks) candidates are tried (bounded by the number of tracks and
+// a wrap guard), so a library where every file is corrupt parks on the last
+// error rather than looping forever. A non-autoplay load — a rescan that
+// removed the current track — never skips, because the user did not ask for
+// playback.
 func (e *Engine) selectTrack(index int, autoplay bool) {
+	e.skipped = 0
+	skipped := 0
+	for {
+		if e.loadTrack(index, autoplay) {
+			if skipped > 0 {
+				// The load published a clean status; republish with the skip
+				// count so the UI can explain where playback landed.
+				e.skipped = skipped
+				e.publish()
+			}
+			return
+		}
+		if !autoplay || skipped+1 >= len(e.tracks) {
+			return
+		}
+		next, _ := e.order.advance(1)
+		if next == index {
+			return
+		}
+		skipped++
+		index = next
+	}
+}
+
+// loadTrack attempts to open and start one track. It reports whether the track
+// was loaded and playback set up; on failure it leaves the deck parked on the
+// failed track with errText set (selectTrack decides whether to skip onward).
+func (e *Engine) loadTrack(index int, autoplay bool) bool {
 	if e.control != nil {
 		speaker.Lock()
 		e.control.Paused = true
@@ -411,6 +457,7 @@ func (e *Engine) selectTrack(index int, autoplay bool) {
 	e.index = index
 	e.order.setCurrent(index)
 	e.errText = ""
+	e.sampleRate = 0
 	e.playing = false
 	e.loading = true
 	e.control = nil
@@ -422,7 +469,7 @@ func (e *Engine) selectTrack(index int, autoplay bool) {
 		e.errText = err.Error()
 		e.loading = false
 		e.publish()
-		return
+		return false
 	}
 	initial, more, err := track.decodeInitial(initialBufferFrames)
 	if err != nil {
@@ -430,14 +477,14 @@ func (e *Engine) selectTrack(index int, autoplay bool) {
 		e.errText = err.Error()
 		e.loading = false
 		e.publish()
-		return
+		return false
 	}
 	if len(initial) == 0 {
 		track.close()
 		e.errText = "audio file contains no samples"
 		e.loading = false
 		e.publish()
-		return
+		return false
 	}
 	var ring *pcmRing
 	if more {
@@ -453,6 +500,7 @@ func (e *Engine) selectTrack(index int, autoplay bool) {
 	}
 	e.ring = ring
 	e.stream = newStreamingTransport(ring, outputRate)
+	e.sampleRate = int(track.inRate)
 	e.stream.SetVolume(e.effectiveVolume())
 	for band, value := range e.eq {
 		e.stream.SetEQ(band, value)
@@ -468,6 +516,7 @@ func (e *Engine) selectTrack(index int, autoplay bool) {
 	e.playing = autoplay
 	e.loading = false
 	e.publish()
+	return true
 }
 
 func (e *Engine) configureTransport() {
@@ -526,13 +575,20 @@ func (e *Engine) publish() {
 		Index: e.index, Count: len(e.tracks), Playing: e.playing,
 		Loading: e.loading, Speed: e.speed, Pitch: e.pitch, Volume: e.volume,
 		Muted: e.muted, Vinyl: e.vinyl, Shuffle: e.shuffle, Repeat: e.repeat,
-		EQ: e.eq, Err: e.errText, Revision: e.revision,
+		EQ: e.eq, Err: e.errText, Revision: e.revision, Skipped: e.skipped,
+		SampleRate: e.sampleRate,
 	}
 	if len(e.tracks) > 0 {
 		status.Track = e.tracks[e.index]
 		if len(e.tracks) > 1 {
-			status.NextIndex, _ = e.order.peek(1)
-			status.NextTrack = e.tracks[status.NextIndex]
+			// NEXT reflects what will actually play: repeat-one replays the
+			// current track, and repeat-off at the end of the order stops, so
+			// NextTrack is left empty rather than wrapping to a track that will
+			// not play.
+			if next, stop := plannedNext(&e.order, e.index, e.repeat, e.shuffle); !stop {
+				status.NextIndex = next
+				status.NextTrack = e.tracks[next]
+			}
 		} else {
 			status.NextIndex = e.index
 			status.NextTrack = e.tracks[e.index]

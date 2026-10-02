@@ -33,7 +33,9 @@ func TestDefaultsBindPlaybackControlsDistinctly(t *testing.T) {
 		"speed_down": keys.SpeedDown, "speed_up": keys.SpeedUp, "pitch_down": keys.PitchDown,
 		"pitch_up": keys.PitchUp, "reset": keys.Reset, "vinyl": keys.Vinyl, "shuffle": keys.Shuffle,
 		"repeat": keys.Repeat, "sort": keys.Sort, "search": keys.Search, "quit": keys.Quit,
-		"rescan": keys.Rescan,
+		"rescan": keys.Rescan, "now_playing": keys.NowPlaying,
+		"eq_low": keys.EQLow, "eq_mid": keys.EQMid, "eq_high": keys.EQHigh,
+		"eq_gain_down": keys.EQGainDown, "eq_gain_up": keys.EQGainUp,
 	}
 	seen := map[string]string{}
 	for action, key := range bound {
@@ -82,6 +84,56 @@ func TestLoadExpandsHomeInMusicDir(t *testing.T) {
 	}
 	if want := filepath.Join(home, "Music"); cfg.MusicDir != want {
 		t.Fatalf("music_dir = %q, want %q", cfg.MusicDir, want)
+	}
+}
+
+func TestLoadStepsDefaultsAndOverrides(t *testing.T) {
+	// Omitted steps keep their defaults.
+	cfg, err := Load(filepath.Join(t.TempDir(), "missing.toml"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Steps != Defaults().Steps {
+		t.Fatalf("default steps = %+v, want %+v", cfg.Steps, Defaults().Steps)
+	}
+
+	// Configured steps are loaded; a misconfigured non-positive value falls
+	// back to the default rather than making a transport key a no-op.
+	path := filepath.Join(t.TempDir(), "config.toml")
+	data := "[steps]\nseek = 10.0\nvolume = 0.0\ntempo = 0.25\npitch = 2.0\neq = 0.2\n"
+	if err := os.WriteFile(path, []byte(data), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err = Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := Defaults().Steps
+	want.Seek, want.Tempo, want.Pitch, want.EQ = 10, 0.25, 2, 0.2
+	if cfg.Steps != want {
+		t.Fatalf("loaded steps = %+v, want %+v", cfg.Steps, want)
+	}
+}
+
+func TestLoadReadsEQAndThemeKeys(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "config.toml")
+	data := "[theme]\nmuted = \"#111111\"\npink = \"#222222\"\nerror = \"#333333\"\n" +
+		"[keybindings]\neq_low = \"q\"\neq_gain_up = \"p\"\n"
+	if err := os.WriteFile(path, []byte(data), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Theme.Muted != "#111111" || cfg.Theme.Pink != "#222222" || cfg.Theme.Error != "#333333" {
+		t.Fatalf("theme colors not loaded: %+v", cfg.Theme)
+	}
+	if cfg.Keybindings.EQLow != "q" || cfg.Keybindings.EQGainUp != "p" {
+		t.Fatalf("EQ keys not loaded: %+v", cfg.Keybindings)
+	}
+	if cfg.Keybindings.EQMid != "2" || cfg.Keybindings.EQGainDown != "-" {
+		t.Fatalf("omitted EQ keys lost defaults: %+v", cfg.Keybindings)
 	}
 }
 

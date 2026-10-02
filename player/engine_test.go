@@ -9,6 +9,7 @@ import (
 
 	"github.com/etokiyra/vynl/library"
 	"github.com/gopxl/beep"
+	"github.com/gopxl/beep/speaker"
 )
 
 func TestDecoderPrebuffersThenCompletesTrackInBackground(t *testing.T) {
@@ -166,6 +167,132 @@ func TestNewEngineRejectsEmptyLibrary(t *testing.T) {
 	if _, err := NewEngine(nil, InitialState{}); err == nil {
 		t.Fatal("NewEngine accepted an empty library")
 	}
+}
+
+// TestSelectTrackSkipsUnplayableTracks is the core auto-skip guarantee: a
+// corrupt file followed by a good one must not stall playback on the corrupt
+// file. The engine opens the good track, marks it playing, and reports how many
+// tracks it skipped so the UI can explain the jump.
+func TestSelectTrackSkipsUnplayableTracks(t *testing.T) {
+	corrupt := writeCorruptFile(t, "bad.mp3")
+	good := writeTestWAV(t, 3, 44100)
+	engine := engineWithTracks(t, []library.Track{{Path: corrupt}, {Path: good}})
+	t.Cleanup(func() { speaker.Clear() })
+
+	engine.selectTrack(0, true)
+
+	if engine.index != 1 {
+		t.Fatalf("index after skip = %d, want 1 (the playable track)", engine.index)
+	}
+	if !engine.playing {
+		t.Fatalf("playback not started on the playable track (err %q)", engine.errText)
+	}
+	if engine.errText != "" {
+		t.Fatalf("errText after a successful skip = %q, want empty", engine.errText)
+	}
+	if engine.skipped != 1 {
+		t.Fatalf("skipped = %d, want 1", engine.skipped)
+	}
+	status := drainStatus(engine)
+	if !status.Playing || status.Skipped != 1 || status.Index != 1 {
+		t.Fatalf("published status = playing %t skipped %d index %d, want playing true skipped 1 index 1",
+			status.Playing, status.Skipped, status.Index)
+	}
+	if status.SampleRate != 44100 {
+		t.Fatalf("status sample rate = %d, want 44100 from the loaded file", status.SampleRate)
+	}
+	engine.stopDecoder()
+}
+
+// TestSelectTrackParksWhenEveryTrackFails checks the bound: an all-corrupt
+// library ends parked on a failure with an error rather than looping forever.
+func TestSelectTrackParksWhenEveryTrackFails(t *testing.T) {
+	first := writeCorruptFile(t, "one.mp3")
+	second := writeCorruptFile(t, "two.flac")
+	engine := engineWithTracks(t, []library.Track{{Path: first}, {Path: second}})
+	t.Cleanup(func() { speaker.Clear() })
+
+	done := make(chan struct{})
+	go func() {
+		engine.selectTrack(0, true)
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(10 * time.Second):
+		t.Fatal("selectTrack did not terminate on an all-corrupt library")
+	}
+
+	if engine.playing {
+		t.Fatal("played a track even though every file was corrupt")
+	}
+	if engine.errText == "" {
+		t.Fatal("no error surfaced after every track failed")
+	}
+	if engine.control != nil || engine.stream != nil {
+		t.Fatal("engine left audio state set after total load failure")
+	}
+	if engine.skipped != 0 {
+		t.Fatalf("skipped = %d with no successful landing, want 0", engine.skipped)
+	}
+}
+
+// TestSelectTrackDoesNotSkipWithoutAutoplay covers the rescan path: a removed
+// current track parks paused on a corrupt replacement instead of auto-playing
+// something the user did not ask for.
+func TestSelectTrackDoesNotSkipWithoutAutoplay(t *testing.T) {
+	corrupt := writeCorruptFile(t, "bad.mp3")
+	good := writeTestWAV(t, 3, 44100)
+	engine := engineWithTracks(t, []library.Track{{Path: corrupt}, {Path: good}})
+	t.Cleanup(func() { speaker.Clear() })
+
+	engine.selectTrack(0, false)
+
+	if engine.index != 0 {
+		t.Fatalf("non-autoplay load skipped to index %d, want to stay on 0", engine.index)
+	}
+	if engine.playing {
+		t.Fatal("non-autoplay load started playback")
+	}
+	if engine.errText == "" {
+		t.Fatal("failed non-autoplay load did not surface an error")
+	}
+}
+
+// engineWithTracks builds a minimal, actor-free engine for load-path tests. Its
+// play order is initialized because selectTrack drives it directly.
+func engineWithTracks(t *testing.T, tracks []library.Track) *Engine {
+	t.Helper()
+	engine := &Engine{
+		tracks:   tracks,
+		updates:  make(chan Status, 1),
+		speed:    1,
+		analyzer: newSpectrumAnalyzer(analyzerSize, outputRate),
+	}
+	engine.order = newPlayOrder(len(tracks))
+	return engine
+}
+
+// drainStatus returns the most recently published status, draining any older
+// single-slot value first.
+func drainStatus(engine *Engine) Status {
+	var status Status
+	for {
+		select {
+		case status = <-engine.updates:
+		default:
+			return status
+		}
+	}
+}
+
+func writeCorruptFile(t *testing.T, name string) string {
+	t.Helper()
+	path := filepath.Join(t.TempDir(), name)
+	if err := os.WriteFile(path, []byte("this is definitely not a decodable audio file"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	return path
 }
 
 func TestPlanTrackSwapKeepsOrFallsBack(t *testing.T) {
@@ -332,6 +459,44 @@ func TestPublishCarriesRevisionAndPathKeyedNextTrack(t *testing.T) {
 	}
 	if status.Track.Path != "a" || status.NextTrack.Path != "b" {
 		t.Fatalf("status tracks = %+v / next %+v, want a / b", status.Track, status.NextTrack)
+	}
+}
+
+// TestPublishNextTrackHonorsStopAndRepeat checks that NEXT agrees with what
+// playback will actually do: repeat-one shows the current track, and repeat-off
+// at the end of the order reports no next track (playback stops).
+func TestPublishNextTrackHonorsStopAndRepeat(t *testing.T) {
+	newEngine := func(repeat RepeatMode, index int) *Engine {
+		engine := &Engine{
+			tracks:  []library.Track{{Path: "a"}, {Path: "b"}, {Path: "c"}},
+			updates: make(chan Status, 1),
+			index:   index,
+			repeat:  repeat,
+		}
+		engine.order = newPlayOrder(3)
+		engine.order.setCurrent(index)
+		return engine
+	}
+
+	cases := []struct {
+		name   string
+		repeat RepeatMode
+		index  int
+		want   string
+	}{
+		{"repeat-off at the end stops", RepeatOff, 2, ""},
+		{"repeat-all wraps", RepeatAll, 2, "a"},
+		{"repeat-one replays current", RepeatOne, 1, "b"},
+		{"mid-queue advances", RepeatOff, 0, "b"},
+	}
+	for _, test := range cases {
+		t.Run(test.name, func(t *testing.T) {
+			engine := newEngine(test.repeat, test.index)
+			engine.publish()
+			if got := (<-engine.updates).NextTrack.Path; got != test.want {
+				t.Fatalf("NEXT = %q, want %q", got, test.want)
+			}
+		})
 	}
 }
 

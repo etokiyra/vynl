@@ -9,6 +9,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"runtime/debug"
 
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/etokiyra/vynl/config"
@@ -17,10 +18,20 @@ import (
 	"github.com/etokiyra/vynl/ui"
 )
 
+// version is the release string, overridable at build time with
+// -ldflags "-X main.version=vX.Y.Z". It defaults to "dev" for source builds.
+var version = "dev"
+
 func main() {
 	configPath := flag.String("config", "", "path to TOML config file")
 	musicDir := flag.String("music-dir", "", "directory to scan for music")
+	showVersion := flag.Bool("version", false, "print version information and exit")
 	flag.Parse()
+
+	if *showVersion {
+		fmt.Println(versionLine())
+		return
+	}
 
 	path := *configPath
 	if path == "" {
@@ -91,6 +102,34 @@ func main() {
 	if runErr != nil && !errors.Is(runErr, tea.ErrInterrupted) {
 		log.Print(runErr)
 	}
+}
+
+// versionLine is the output of -version. It includes the Go toolchain and
+// platform so a bug report can be reproduced, plus a VCS revision when the
+// binary was built from a git checkout.
+func versionLine() string {
+	line := fmt.Sprintf("vynl %s (%s %s/%s)", version, runtime.Version(), runtime.GOOS, runtime.GOARCH)
+	if info, ok := debug.ReadBuildInfo(); ok {
+		revision, modified := "", false
+		for _, setting := range info.Settings {
+			switch setting.Key {
+			case "vcs.revision":
+				revision = setting.Value
+			case "vcs.modified":
+				modified = setting.Value == "true"
+			}
+		}
+		if revision != "" {
+			if len(revision) > 12 {
+				revision = revision[:12]
+			}
+			if modified {
+				revision += "+dirty"
+			}
+			line += " rev " + revision
+		}
+	}
+	return line
 }
 
 // persistState writes the engine's latest playback settings beside the config.

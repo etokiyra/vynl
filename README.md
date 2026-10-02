@@ -41,10 +41,14 @@ transparent terminals like kitty, foot, or Alacritty.
   (Hann-windowed, mapped to 48 log-spaced bands) with peak-hold markers drives
   the visualizer; the stereo L/R VU meters and numeric level readouts are
   signal-derived separately
-- 🎛️ **3-band EQ** — low / mid / high gain control built from lightweight
-  single-pole filters, with a soft limiter so EQ/volume boosts can't hard-clip
+- 🎛️ **3-band EQ** — low / mid / high gain from a 3-way Linkwitz-Riley
+  crossover (4th-order biquad sections), with a soft limiter so EQ/volume boosts
+  can't hard-clip; a flat EQ stays exactly transparent
 - 🔀 **Shuffle, repeat & transport** — shuffle the play order, cycle repeat
   off / all / one, and mute, restart, or seek from the keyboard
+- 🩹 **Resilient playback** — a corrupt or unplayable file is skipped
+  automatically (bounded by the library size) and the deck shows how many were
+  passed over, so one bad file never stalls a session
 - 📚 **Local library browser** — scans a folder for supported formats, reads
   tags off the UI thread (so startup is not blocked), fuzzy search, sortable
   browsing, a preview of the next track, and rescan without restarting
@@ -95,6 +99,9 @@ vynl -music-dir /path/to/music
 
 # Use a specific config file
 vynl -config /path/to/config.toml
+
+# Print version, toolchain, and platform
+vynl -version
 ```
 
 ---
@@ -116,11 +123,12 @@ vynl -config /path/to/config.toml
 | `M`           | Mute / unmute                    |
 | `Z`           | Toggle shuffle                   |
 | `C`           | Cycle repeat: off → all → one    |
-| `1` / `2` / `3` | Select EQ band (low/mid/high)  |
-| `+` / `-`     | Adjust selected EQ band gain (0.1); `=` also boosts |
+| `1` / `2` / `3` | Select EQ band (low/mid/high; configurable) |
+| `+` / `-`     | Adjust selected EQ band gain; `=` also boosts (configurable) |
 | `Tab`         | Switch focus: library ↔ deck     |
 | `/`           | Search library                   |
 | `O`           | Cycle sort: path → title → artist → album |
+| `G`           | Jump the library cursor to the playing track |
 | `F5`          | Rescan the music folder                   |
 | `?`           | Show the full keybinding help    |
 | `Ctrl+C`      | Quit (always, even while searching) |
@@ -147,6 +155,16 @@ foreground = "#e8edf2"
 cyan       = "#45e6dc"
 magenta    = "#f05bd5"
 green      = "#b7f36b"
+muted      = "#78828e"
+pink       = "#ff77c8"
+error      = "#ff6b6b"
+
+[steps]
+seek   = 5.0
+volume = 0.05
+tempo  = 0.05
+pitch  = 1.0
+eq     = 0.1
 
 [keybindings]
 toggle        = " "
@@ -169,15 +187,23 @@ shuffle       = "z"
 repeat        = "c"
 sort          = "o"
 rescan        = "f5"
+now_playing   = "g"
 search        = "/"
 quit          = "q"
+eq_low        = "1"
+eq_mid        = "2"
+eq_high       = "3"
+eq_gain_down  = "-"
+eq_gain_up    = "+"
 ```
 
-Only `foreground`, `cyan`, `magenta`, and `green` are used for theming. VYNL
-never paints a background (transparency is intentional), some greys/pinks are
-fixed, and keys that VYNL does not recognize are accepted but ignored. Every
-`[keybindings]` entry above is honored except the fixed EQ keys (`1`/`2`/`3` and
-`+`/`-`/`=`).
+Every colour VYNL paints is themeable (`foreground`, `cyan`, `magenta`, `green`,
+`muted`, `pink`, `error`), and every action in the `[keybindings]` table above is
+honored — including the EQ bands and gain. The `[steps]` table controls how far
+each key moves: seek in seconds, volume as a 0–1 fraction, tempo as a speed
+multiple, pitch in semitones, and EQ gain in band units. A non-positive step
+silently falls back to its default. VYNL never paints a background colour, so
+there is no `background` key — transparency is intentional.
 
 VYNL also remembers your volume, mute, EQ, shuffle, vinyl, and repeat settings
 across runs. It writes them to a separate `state.toml` beside the config file
@@ -233,8 +259,8 @@ command/status channels.
   the whole track, so long files no longer use significant RAM. The tradeoff is
   that a distant seek waits for the decoder to reposition and refill, which
   shows as brief buffering; seeks inside the resident window are instant
-- The 3-band EQ is two one-pole low-passes (with a soft limiter); it is
-  effective but gentle, and gentler than biquad shelving filters would be
+- The 3-band EQ is a fixed-crossover design (250 Hz / 4 kHz), not a parametric
+  EQ; the crossover frequencies are not user-configurable
 - Volume, mute, EQ, shuffle, vinyl, and repeat are saved to a separate
   `state.toml` and restored on the next run; a corrupt state file falls back to
   defaults with a warning. The current track and playback position are not
@@ -250,8 +276,6 @@ command/status channels.
   the rest of the library still loads
 - Extreme speed/pitch settings can introduce minor artifacts on
   percussion-heavy material, due to the grain-based resampling approach
-- The EQ band keys (`1`/`2`/`3`) and gain keys (`+`/`-`/`=`) are hardcoded; the
-  rest of the keymap is configurable
 
 ---
 
@@ -273,19 +297,23 @@ order.
 - [x] **Rescan library** — `F5` re-walks the music folder and reloads the track
       list without restarting, keeping the current track playing and streaming
       the new list's tags in asynchronously
-- [ ] **Auto-skip corrupt tracks** — advance past files that fail to decode
-      instead of stalling
+- [x] **Auto-skip corrupt tracks** — an unplayable file is skipped
+      automatically (bounded by the library size) and the deck reports how many
+      were passed over, so one bad file never stalls a session
 
 ### Quality
 
-- [ ] **Biquad/shelving EQ** — replace the two one-pole filters with proper
-      shelving filters for more musical tone control
+- [x] **Biquad/shelving EQ** — the 3-band EQ now uses a 3-way Linkwitz-Riley
+      crossover (4th-order biquad sections) for much steeper, more musical tone
+      control while keeping a flat EQ transparent
 - [ ] **Loudness normalization** — optional ReplayGain-style per-track gain for
       consistent levels
-- [ ] **Fully configurable keys and steps** — expose the EQ keys and the
-      seek/volume/tempo/pitch step sizes
-- [ ] **Complete theming** — wire up (or remove) the currently ignored
-      `background` key and make the remaining fixed greys/pinks themeable
+- [x] **Fully configurable keys and steps** — the EQ keys and the
+      seek/volume/tempo/pitch/EQ step sizes are exposed via `[keybindings]` and
+      `[steps]`
+- [x] **Complete theming** — `muted`, `pink`, and `error` are themeable, so
+      every colour VYNL paints is configurable; the ignored `background` key was
+      removed (VYNL never paints a background)
 
 ### Features
 
@@ -307,8 +335,10 @@ go vet ./...
 
 There is no CI or Makefile; each package owns its tests. The transport is
 required to stay allocation-free in steady-state playback, which a test
-enforces. See [`AGENTS.md`](AGENTS.md) for the architecture and concurrency
-rules.
+enforces. `vynl -version` reports the release string, Go toolchain, platform, and
+VCS revision; packagers can stamp a release with
+`go build -ldflags "-X main.version=v1.2.3"`. See [`AGENTS.md`](AGENTS.md) for
+the architecture and concurrency rules.
 
 ---
 

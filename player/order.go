@@ -130,11 +130,11 @@ func (o *playOrder) advance(delta int) (index int, wrapped bool) {
 	return index, wrapped
 }
 
-// repeatAdvance decides which track should play when current finishes, and
-// whether playback should stop at the end of the order. RepeatOne replays
-// current; RepeatOff stops after the last entry unless shuffle is active
-// (shuffle always loops).
-func repeatAdvance(order *playOrder, current int, repeat RepeatMode, shuffle bool) (index int, stop bool) {
+// plannedNext decides which track would play when current finishes, without
+// moving the play order. stop is true when playback should end instead (repeat
+// off at the end of the order). RepeatOne reports the current track, which is
+// what will actually replay.
+func plannedNext(order *playOrder, current int, repeat RepeatMode, shuffle bool) (index int, stop bool) {
 	if repeat == RepeatOne || len(order.indices) == 0 {
 		return current, false
 	}
@@ -142,6 +142,18 @@ func repeatAdvance(order *playOrder, current int, repeat RepeatMode, shuffle boo
 	if wrapped && repeat == RepeatOff && !shuffle {
 		return current, true
 	}
-	order.advance(1)
 	return next, false
+}
+
+// repeatAdvance decides which track should play when current finishes, and
+// whether playback should stop at the end of the order. RepeatOne replays
+// current; RepeatOff stops after the last entry unless shuffle is active
+// (shuffle always loops).
+func repeatAdvance(order *playOrder, current int, repeat RepeatMode, shuffle bool) (index int, stop bool) {
+	index, stop = plannedNext(order, current, repeat, shuffle)
+	if stop || repeat == RepeatOne || len(order.indices) == 0 {
+		return index, stop
+	}
+	order.advance(1)
+	return index, false
 }

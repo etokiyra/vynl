@@ -61,6 +61,26 @@ func TestViewFitsTerminalSize(t *testing.T) {
 	}
 }
 
+func TestViewHandlesTinyTerminals(t *testing.T) {
+	sizes := [][2]int{{0, 0}, {1, 1}, {2, 2}, {3, 3}, {10, 4}, {23, 11}, {24, 12}, {72, 12}, {300, 5}}
+	for _, size := range sizes {
+		model := NewModel([]library.Track{{Title: "Tiny", Path: "tiny.flac"}}, nil, config.Defaults())
+		model.width, model.height = size[0], size[1]
+		model.status = player.Status{
+			Track: library.Track{Title: "Tiny", Path: "tiny.flac"},
+			Count: 1, Playing: true, Speed: 1, Volume: 0.5, Duration: 10, Position: 3,
+		}
+		func() {
+			defer func() {
+				if r := recover(); r != nil {
+					t.Errorf("View panicked at %dx%d: %v", size[0], size[1], r)
+				}
+			}()
+			_ = model.View()
+		}()
+	}
+}
+
 func TestWindowSizeMessageSetsInitialDimensions(t *testing.T) {
 	model := NewModel(nil, nil, config.Defaults())
 	if model.width != 0 || model.height != 0 {
@@ -528,6 +548,104 @@ func TestLibraryMarksPlayingTrackAndActiveFilter(t *testing.T) {
 	}
 }
 
+func TestDeckShowsSkippedNotice(t *testing.T) {
+	model := NewModel(nil, nil, config.Defaults())
+	model.status = player.Status{Playing: true, Count: 2, Volume: 0.5, Skipped: 2}
+	panel := ansi.Strip(model.deckPanel(80, 24, model.palette()))
+	if !strings.Contains(panel, "SKIPPED 2 UNPLAYABLE") {
+		t.Fatalf("deck did not surface skipped tracks:\n%s", panel)
+	}
+
+	// A hard error is more important than the informational skip notice.
+	model.status = player.Status{Count: 2, Volume: 0.5, Skipped: 2, Err: "decode failed"}
+	panel = ansi.Strip(model.deckPanel(80, 24, model.palette()))
+	if !strings.Contains(panel, "decode failed") || strings.Contains(panel, "SKIPPED") {
+		t.Fatalf("error did not take precedence over the skip notice:\n%s", panel)
+	}
+}
+
+func TestNowPlayingKeyMovesCursorToLoadedTrack(t *testing.T) {
+	tracks := []library.Track{
+		{Title: "Alpha", Path: "a.flac"},
+		{Title: "Bravo", Path: "b.flac"},
+		{Title: "Charlie", Path: "c.flac"},
+	}
+	model := NewModel(tracks, &player.Engine{}, config.Defaults())
+	model.status = player.Status{Track: tracks[2], Index: 2, Count: 3}
+	model.selected = 0
+
+	updated, _ := model.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("g")})
+	model = updated.(Model)
+	if got := model.tracks[model.visible[model.selected]].Path; got != "c.flac" {
+		t.Fatalf("now-playing key selected %q, want the loaded c.flac", got)
+	}
+
+	// A track filtered out of the view is not selected (the cursor stays put).
+	model.search = "bravo"
+	model.refreshVisible()
+	before := model.selected
+	updated, _ = model.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("g")})
+	model = updated.(Model)
+	if model.selected != before {
+		t.Fatalf("now-playing key moved the cursor to a filtered-out track: %d -> %d", before, model.selected)
+	}
+}
+
+func TestEQKeysAreConfigurable(t *testing.T) {
+	cfg := config.Defaults()
+	cfg.Keybindings.EQLow, cfg.Keybindings.EQMid, cfg.Keybindings.EQHigh = "j", "k", "l"
+	model := NewModel(nil, &player.Engine{}, cfg)
+
+	updated, _ := model.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("l")})
+	model = updated.(Model)
+	if model.eqBand != 2 {
+		t.Fatalf("configured high-band key set band %d, want 2", model.eqBand)
+	}
+
+	// Once rebound, the old hardcoded digit must not select a band.
+	updated, _ = model.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("1")})
+	model = updated.(Model)
+	if model.eqBand != 2 {
+		t.Fatalf("hardcoded band key stayed active after rebinding: band %d", model.eqBand)
+	}
+
+	panel := ansi.Strip(model.eqPanel(80, 5, model.palette()))
+	if !strings.Contains(panel, "J/K/L") {
+		t.Fatalf("EQ panel did not reflect configured band keys:\n%s", panel)
+	}
+}
+
+func TestPaletteUsesThemeColorsForMutedPinkError(t *testing.T) {
+	cfg := config.Defaults()
+	cfg.Theme.Muted, cfg.Theme.Pink, cfg.Theme.Error = "#111111", "#222222", "#333333"
+	palette := NewModel(nil, nil, cfg).palette()
+	cases := map[string]struct {
+		style lipgloss.Style
+		want  string
+	}{
+		"muted": {palette.muted, "#111111"},
+		"pink":  {palette.pink, "#222222"},
+		"error": {palette.error, "#333333"},
+	}
+	for name, test := range cases {
+		got, ok := test.style.GetForeground().(lipgloss.Color)
+		if !ok || string(got) != test.want {
+			t.Errorf("%s color = %v, want %s", name, test.style.GetForeground(), test.want)
+		}
+	}
+}
+
+func TestHelpOverlayListsConfiguredEQKeys(t *testing.T) {
+	cfg := config.Defaults()
+	cfg.Keybindings.EQLow, cfg.Keybindings.EQGainUp = "j", "p"
+	model := NewModel(nil, nil, cfg)
+	model.width, model.height = 100, 30
+	view := ansi.Strip(model.helpOverlay(model.palette()))
+	if !strings.Contains(view, "J 2 3") || !strings.Contains(view, "P -") {
+		t.Fatalf("help overlay did not reflect configured EQ keys:\n%s", view)
+	}
+}
+
 func TestDeckShowsPlaybackModes(t *testing.T) {
 	model := NewModel(nil, nil, config.Defaults())
 	model.status = player.Status{Playing: true, Count: 1, Volume: 0.5, Shuffle: true, Repeat: player.RepeatOne}
@@ -586,14 +704,15 @@ func TestPlaybackPositionFreezesWhileBuffering(t *testing.T) {
 	}
 }
 
-func TestReadTrackDetailsUsesAudioHeaderAndFileStats(t *testing.T) {
+func TestReadTrackDetailsStatsFileAndFormatsDisplay(t *testing.T) {
 	path := writeTestWAV(t, 48000, 4800)
 	details := readTrackDetails(path)
-	if details.format != "WAV" || details.sampleRate != 48000 || details.bytes != int64(44+4800*2) {
-		t.Fatalf("track details = %+v", details)
+	if details.bytes != int64(44+4800*2) {
+		t.Fatalf("file size = %d, want %d", details.bytes, 44+4800*2)
 	}
-	if got := strings.Join(details.displayLines(0.1, NewModel(nil, nil, config.Defaults()).palette()), " "); !strings.Contains(got, "48.0 kHz") || !strings.Contains(got, "AVG") {
-		t.Fatalf("metadata display = %q", got)
+	display := strings.Join(details.displayLines(0.1, 48000, NewModel(nil, nil, config.Defaults()).palette()), " ")
+	if !strings.Contains(display, "WAV") || !strings.Contains(display, "48.0 kHz") || !strings.Contains(display, "AVG") {
+		t.Fatalf("metadata display = %q", display)
 	}
 }
 
@@ -631,8 +750,8 @@ func TestTrackDetailsLoadAsynchronously(t *testing.T) {
 	if model.loaded.path != path {
 		t.Fatalf("reserved details path = %q, want %q", model.loaded.path, path)
 	}
-	if model.loaded.sampleRate != 0 {
-		t.Fatalf("details were read synchronously: sample rate %d", model.loaded.sampleRate)
+	if model.loaded.bytes != 0 {
+		t.Fatalf("details were read synchronously: bytes %d", model.loaded.bytes)
 	}
 
 	message := loadTrackDetails(path)()
@@ -640,14 +759,14 @@ func TestTrackDetailsLoadAsynchronously(t *testing.T) {
 		t.Fatalf("detail command returned %T, want trackDetailsMsg", message)
 	}
 	updated, _ = model.Update(message)
-	if got := updated.(Model).loaded.sampleRate; got != 48000 {
-		t.Fatalf("loaded sample rate = %d, want 48000", got)
+	if got := updated.(Model).loaded.bytes; got != int64(44+4800*2) {
+		t.Fatalf("loaded file size = %d, want %d", got, 44+4800*2)
 	}
 
 	model = updated.(Model)
-	updated, _ = model.Update(trackDetailsMsg(trackDetails{path: "other.wav", sampleRate: 44100}))
-	if got := updated.(Model).loaded.sampleRate; got != 48000 {
-		t.Fatalf("stale detail message was applied: sample rate %d", got)
+	updated, _ = model.Update(trackDetailsMsg(trackDetails{path: "other.wav", bytes: 1}))
+	if got := updated.(Model).loaded.bytes; got != int64(44+4800*2) {
+		t.Fatalf("stale detail message was applied: bytes %d", got)
 	}
 }
 
@@ -677,8 +796,8 @@ func writeTestWAV(t *testing.T, sampleRate, frames int) string {
 func TestLibraryUsesMetadataAndStereoMeterForRemainingSpace(t *testing.T) {
 	track := library.Track{Title: "Only Track", Artist: "One Artist", Path: "/music/only.wav"}
 	model := NewModel([]library.Track{track}, nil, config.Defaults())
-	model.status = player.Status{Track: track, Count: 1, Duration: 180, Playing: true, ChannelRMS: [2]float64{0.5, 0.2}}
-	model.loaded = trackDetails{path: track.Path, format: "WAV", sampleRate: 48000, bytes: 1200000}
+	model.status = player.Status{Track: track, Count: 1, Duration: 180, Playing: true, ChannelRMS: [2]float64{0.5, 0.2}, SampleRate: 48000}
+	model.loaded = trackDetails{path: track.Path, bytes: 1200000}
 	panel := ansi.Strip(model.libraryPanel(50, 30, model.palette()))
 	for _, expected := range []string{"NOW LOADED", "WAV", "48.0 kHz", "L       R"} {
 		if !strings.Contains(panel, expected) {

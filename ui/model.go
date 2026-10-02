@@ -18,11 +18,6 @@ import (
 	"github.com/etokiyra/vynl/config"
 	"github.com/etokiyra/vynl/library"
 	"github.com/etokiyra/vynl/player"
-	"github.com/gopxl/beep"
-	"github.com/gopxl/beep/flac"
-	"github.com/gopxl/beep/mp3"
-	"github.com/gopxl/beep/vorbis"
-	"github.com/gopxl/beep/wav"
 )
 
 type tickMsg time.Time
@@ -76,11 +71,9 @@ func (s trackSort) next() trackSort {
 }
 
 type trackDetails struct {
-	path       string
-	format     string
-	sampleRate int
-	bytes      int64
-	readErr    string
+	path    string
+	bytes   int64
+	readErr string
 }
 
 type Model struct {
@@ -347,6 +340,7 @@ func (m Model) updateKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	}
 
 	keys := m.config.Keybindings
+	steps := m.config.Steps
 	switch {
 	case key == keys.Quit:
 		return m, tea.Quit
@@ -368,33 +362,33 @@ func (m Model) updateKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	case key == keys.Prev:
 		m.engine.Send(player.Command{Action: player.Prev})
 	case key == keys.SeekBack:
-		m.engine.Send(player.Command{Action: player.Seek, Value: -5})
+		m.engine.Send(player.Command{Action: player.Seek, Value: -steps.Seek})
 	case key == keys.SeekForward:
-		m.engine.Send(player.Command{Action: player.Seek, Value: 5})
+		m.engine.Send(player.Command{Action: player.Seek, Value: steps.Seek})
 	case key == keys.Restart:
 		m.engine.Send(player.Command{Action: player.Restart})
 	case key == keys.VolumeUp:
 		if m.deckFocused {
-			m.engine.Send(player.Command{Action: player.Volume, Value: 0.05})
+			m.engine.Send(player.Command{Action: player.Volume, Value: steps.Volume})
 		} else {
 			m.moveSelection(-1)
 		}
 	case key == keys.VolumeDown:
 		if m.deckFocused {
-			m.engine.Send(player.Command{Action: player.Volume, Value: -0.05})
+			m.engine.Send(player.Command{Action: player.Volume, Value: -steps.Volume})
 		} else {
 			m.moveSelection(1)
 		}
 	case key == keys.Mute:
 		m.engine.Send(player.Command{Action: player.Mute})
 	case key == keys.SpeedDown:
-		m.engine.Send(player.Command{Action: player.Speed, Value: -0.05})
+		m.engine.Send(player.Command{Action: player.Speed, Value: -steps.Tempo})
 	case key == keys.SpeedUp:
-		m.engine.Send(player.Command{Action: player.Speed, Value: 0.05})
+		m.engine.Send(player.Command{Action: player.Speed, Value: steps.Tempo})
 	case key == keys.PitchDown:
-		m.engine.Send(player.Command{Action: player.Pitch, Value: -1})
+		m.engine.Send(player.Command{Action: player.Pitch, Value: -steps.Pitch})
 	case key == keys.PitchUp:
-		m.engine.Send(player.Command{Action: player.Pitch, Value: 1})
+		m.engine.Send(player.Command{Action: player.Pitch, Value: steps.Pitch})
 	case key == keys.Reset:
 		m.engine.Send(player.Command{Action: player.Reset})
 	case key == keys.Vinyl:
@@ -408,12 +402,18 @@ func (m Model) updateKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		m.refreshVisible()
 	case key == keys.Rescan:
 		return m, m.startRescan()
-	case key == "1", key == "2", key == "3":
-		m.eqBand = int(key[0] - '1')
-	case key == "-":
-		m.engine.Send(player.Command{Action: player.EQ, Band: m.eqBand, Value: -0.1})
-	case key == "+", key == "=":
-		m.engine.Send(player.Command{Action: player.EQ, Band: m.eqBand, Value: 0.1})
+	case key == keys.NowPlaying:
+		m.selectPlaying()
+	case key == keys.EQLow:
+		m.eqBand = 0
+	case key == keys.EQMid:
+		m.eqBand = 1
+	case key == keys.EQHigh:
+		m.eqBand = 2
+	case key == keys.EQGainDown:
+		m.engine.Send(player.Command{Action: player.EQ, Band: m.eqBand, Value: -steps.EQ})
+	case key == keys.EQGainUp, key == "=":
+		m.engine.Send(player.Command{Action: player.EQ, Band: m.eqBand, Value: steps.EQ})
 	case key == "up":
 		m.moveSelection(-1)
 	case key == "down":
@@ -571,7 +571,8 @@ func (m Model) helpLine(p palette) string {
 	return p.muted.Render("↑/↓ browse   ENTER load   " + keyLabel(keys.Search) +
 		" find   " + keyLabel(keys.Sort) + " sort   " + keyLabel(keys.Rescan) + " rescan   " +
 		keyLabel(keys.Toggle) + " play   " +
-		keyLabel(keys.Next) + "/" + keyLabel(keys.Prev) + " track   TAB deck   ? help   " + keyLabel(keys.Quit) + " quit")
+		keyLabel(keys.Next) + "/" + keyLabel(keys.Prev) + " track   " +
+		keyLabel(keys.NowPlaying) + " now   TAB deck   ? help   " + keyLabel(keys.Quit) + " quit")
 }
 
 // keyLabel renders a configured key in a form that reads well in the help bar.
@@ -623,8 +624,9 @@ func (m Model) helpEntries() []helpEntry {
 		{keyLabel(keys.Repeat), "Cycle repeat off/all/one"},
 		{keyLabel(keys.Sort), "Cycle library sort order"},
 		{keyLabel(keys.Rescan), "Rescan library"},
-		{"1 2 3", "Select EQ band"},
-		{"+ -", "Adjust selected EQ band"},
+		{keyLabel(keys.NowPlaying), "Jump to playing track"},
+		{keyLabel(keys.EQLow) + " " + keyLabel(keys.EQMid) + " " + keyLabel(keys.EQHigh), "Select EQ band"},
+		{keyLabel(keys.EQGainUp) + " " + keyLabel(keys.EQGainDown), "Adjust selected EQ band"},
 		{"TAB", "Switch focus"},
 		{keyLabel(keys.Search), "Search library"},
 		{keyLabel(keys.Quit), "Quit"},
@@ -772,6 +774,9 @@ func (m Model) deckPanel(width, height int, p palette) string {
 	baseLines = append(baseLines, p.text.Render(truncate(controlText, inner, "~")))
 	if m.status.Err != "" {
 		baseLines = append(baseLines, p.error.Render(truncate(m.status.Err, inner, "…")))
+	} else if m.status.Skipped > 0 {
+		baseLines = append(baseLines, p.muted.Render(truncate(
+			fmt.Sprintf("SKIPPED %d UNPLAYABLE", m.status.Skipped), inner, "…")))
 	}
 	visualizerHeight := max(0, contentHeight-len(baseLines))
 	needle := -1
@@ -793,7 +798,7 @@ func (m Model) libraryPanel(width, height int, p palette) string {
 	if inner > 30 {
 		entryHeight = 2
 	}
-	metaLines := m.loaded.displayLines(m.status.Duration, p)
+	metaLines := m.loaded.displayLines(m.status.Duration, m.status.SampleRate, p)
 	reserved := 2 + 1 + len(metaLines)
 	// Use all the vertical space the panel affords (reserving a few rows for
 	// the metadata block and stereo meter) instead of a fixed track count.
@@ -893,7 +898,11 @@ func (m Model) eqPanel(width, height int, p palette) string {
 		}
 		values = append(values, label+" "+p.green.Render(slider(m.status.EQ[i]/2, 8)))
 	}
-	return panel("EQUALIZER", strings.Join(values, "   ")+"   "+p.muted.Render("BAND 1/2/3  +/- GAIN"), width, height, p.green, p.background)
+	keys := m.config.Keybindings
+	hint := fmt.Sprintf("BAND %s/%s/%s  %s/%s GAIN",
+		keyLabel(keys.EQLow), keyLabel(keys.EQMid), keyLabel(keys.EQHigh),
+		keyLabel(keys.EQGainUp), keyLabel(keys.EQGainDown))
+	return panel("EQUALIZER", strings.Join(values, "   ")+"   "+p.muted.Render(hint), width, height, p.green, p.background)
 }
 
 func (m *Model) moveSelection(delta int) {
@@ -901,6 +910,23 @@ func (m *Model) moveSelection(delta int) {
 		return
 	}
 	m.selected = (m.selected + delta + len(m.visible)) % len(m.visible)
+}
+
+// selectPlaying moves the library cursor onto the currently loaded track when it
+// is present in the filtered view, so a large (or auto-advancing) library can be
+// located at a keystroke. It is a no-op when nothing is loaded or the track is
+// filtered out.
+func (m *Model) selectPlaying() {
+	path := m.status.Track.Path
+	if path == "" {
+		return
+	}
+	for position, index := range m.visible {
+		if index >= 0 && index < len(m.tracks) && m.tracks[index].Path == path {
+			m.selected = position
+			return
+		}
+	}
 }
 
 func (m *Model) refreshVisible() {
@@ -1507,61 +1533,36 @@ func loadTrackDetails(path string) tea.Cmd {
 }
 
 func readTrackDetails(path string) trackDetails {
-	details := trackDetails{path: path, format: strings.TrimPrefix(strings.ToUpper(filepath.Ext(path)), ".")}
+	details := trackDetails{path: path}
 	if path == "" {
 		return details
 	}
-	info, err := os.Stat(path)
-	if err != nil {
+	// Only stat the file: the sample rate and duration come from the engine's
+	// status, so the UI never decodes audio (a redundant, potentially full-file
+	// decode that would otherwise repeat the engine's work).
+	if info, err := os.Stat(path); err != nil {
 		details.readErr = err.Error()
-		return details
-	}
-	details.bytes = info.Size()
-	file, err := os.Open(path)
-	if err != nil {
-		details.readErr = err.Error()
-		return details
-	}
-	defer file.Close()
-	var stream beep.StreamSeekCloser
-	var format beep.Format
-	switch strings.ToLower(filepath.Ext(path)) {
-	case ".mp3":
-		stream, format, err = mp3.Decode(file)
-	case ".flac":
-		stream, format, err = flac.Decode(file)
-	case ".wav":
-		stream, format, err = wav.Decode(file)
-	case ".ogg":
-		stream, format, err = vorbis.Decode(file)
-	default:
-		err = fmt.Errorf("unsupported format")
-	}
-	if err != nil {
-		details.readErr = err.Error()
-		return details
-	}
-	if stream != nil {
-		defer stream.Close()
-		details.sampleRate = int(format.SampleRate)
+	} else {
+		details.bytes = info.Size()
 	}
 	return details
 }
 
-func (d trackDetails) displayLines(duration float64, p palette) []string {
+func (d trackDetails) displayLines(duration float64, sampleRate int, p palette) []string {
 	if d.path == "" {
 		return []string{p.muted.Render("No track loaded")}
 	}
+	format := strings.TrimPrefix(strings.ToUpper(filepath.Ext(d.path)), ".")
 	bitrate := "--"
 	if duration > 0 && d.bytes > 0 {
 		bitrate = fmt.Sprintf("%d kb/s avg", int(float64(d.bytes)*8/duration/1000))
 	}
 	rate := "unknown"
-	if d.sampleRate > 0 {
-		rate = strconv.FormatFloat(float64(d.sampleRate)/1000, 'f', 1, 64) + " kHz"
+	if sampleRate > 0 {
+		rate = strconv.FormatFloat(float64(sampleRate)/1000, 'f', 1, 64) + " kHz"
 	}
 	return []string{
-		p.text.Render(fmt.Sprintf("%s  /  %s", d.format, rate)),
+		p.text.Render(fmt.Sprintf("%s  /  %s", format, rate)),
 		p.muted.Render(fmt.Sprintf("%s  /  %s", clock(duration), formatBytes(d.bytes))),
 		p.muted.Render("AVG " + bitrate),
 	}
@@ -1595,20 +1596,19 @@ func (m Model) palette() palette {
 		background:      lipgloss.NewStyle().Foreground(foregroundColor),
 		foregroundColor: foregroundColor,
 		text:            lipgloss.NewStyle().Foreground(foregroundColor),
-		muted:           lipgloss.NewStyle().Foreground(lipgloss.Color("#78828e")),
+		muted:           lipgloss.NewStyle().Foreground(color(theme.Muted, defaults.Muted)),
 		cyan:            lipgloss.NewStyle().Foreground(color(theme.Cyan, defaults.Cyan)),
 		magenta:         lipgloss.NewStyle().Foreground(color(theme.Magenta, defaults.Magenta)),
-		pink:            lipgloss.NewStyle().Foreground(lipgloss.Color("#ff77c8")),
+		pink:            lipgloss.NewStyle().Foreground(color(theme.Pink, defaults.Pink)),
 		green:           lipgloss.NewStyle().Foreground(color(theme.Green, defaults.Green)),
-		wave:            lipgloss.NewStyle().Foreground(color(theme.Cyan, defaults.Cyan)),
-		error:           lipgloss.NewStyle().Foreground(lipgloss.Color("#ff6b6b")),
+		error:           lipgloss.NewStyle().Foreground(color(theme.Error, defaults.Error)),
 	}
 }
 
 type palette struct {
-	background, text, muted, cyan, magenta, green, wave, error lipgloss.Style
-	pink                                                       lipgloss.Style
-	foregroundColor                                            lipgloss.Color
+	background, text, muted, cyan, magenta, green, error lipgloss.Style
+	pink                                                 lipgloss.Style
+	foregroundColor                                      lipgloss.Color
 }
 
 func tick() tea.Cmd {

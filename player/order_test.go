@@ -115,6 +115,40 @@ func TestRepeatAdvanceHonorsModes(t *testing.T) {
 	}
 }
 
+// TestPlannedNextMatchesRepeatAdvance locks the pure "what plays next" decision
+// to the mutating advance logic, so the deck's NEXT line can never disagree with
+// what playback actually does.
+func TestPlannedNextMatchesRepeatAdvance(t *testing.T) {
+	cases := []struct {
+		repeat  RepeatMode
+		shuffle bool
+		start   int
+	}{
+		{RepeatOff, false, 0},
+		{RepeatOff, false, 2},
+		{RepeatAll, false, 2},
+		{RepeatOne, false, 1},
+		{RepeatOff, true, 2},
+		{RepeatAll, true, 0},
+	}
+	for _, test := range cases {
+		planned := newPlayOrder(3)
+		planned.setCurrent(test.start)
+		advanced := newPlayOrder(3)
+		advanced.setCurrent(test.start)
+
+		wantIndex, wantStop := repeatAdvance(&advanced, test.start, test.repeat, test.shuffle)
+		gotIndex, gotStop := plannedNext(&planned, test.start, test.repeat, test.shuffle)
+		if gotIndex != wantIndex || gotStop != wantStop {
+			t.Errorf("plannedNext(%v, shuffle=%t, start=%d) = (%d,%t), repeatAdvance = (%d,%t)",
+				test.repeat, test.shuffle, test.start, gotIndex, gotStop, wantIndex, wantStop)
+		}
+		if planned.pos != test.start {
+			t.Errorf("plannedNext moved the order: pos %d, want %d", planned.pos, test.start)
+		}
+	}
+}
+
 func TestRepeatModeCycles(t *testing.T) {
 	mode := RepeatOff
 	want := []RepeatMode{RepeatAll, RepeatOne, RepeatOff, RepeatAll}

@@ -234,6 +234,46 @@ func TestTransportLimitsClipping(t *testing.T) {
 	}
 }
 
+// TestCrossoverFiltersSeparateBands checks the 3-way Linkwitz-Riley crossover
+// actually splits the spectrum: the low band passes bass and rejects treble,
+// and the high band does the opposite. The unity reconstruction identity
+// (low + (in-low-high) + high == in) is exercised by the RMS tests.
+func TestCrossoverFiltersSeparateBands(t *testing.T) {
+	const rate = 48000
+	streamer := newTransportStreamer(testTone(8), rate)
+	lowAt := func(freq float64) float64 { return crossoverGain(streamer.processLow, freq, rate) }
+	highAt := func(freq float64) float64 { return crossoverGain(streamer.processHigh, freq, rate) }
+
+	if gain := lowAt(100); gain < 0.95 {
+		t.Fatalf("low band gain at 100 Hz = %.3f, want ~1", gain)
+	}
+	if gain := lowAt(10000); gain > 0.05 {
+		t.Fatalf("low band gain at 10 kHz = %.3f, want ~0", gain)
+	}
+	if gain := highAt(10000); gain < 0.95 {
+		t.Fatalf("high band gain at 10 kHz = %.3f, want ~1", gain)
+	}
+	if gain := highAt(100); gain > 0.05 {
+		t.Fatalf("high band gain at 100 Hz = %.3f, want ~0", gain)
+	}
+}
+
+// crossoverGain measures the steady-state RMS gain of one filter channel,
+// skipping the first half of the run to avoid the filter transient.
+func crossoverGain(process func(int, float64) float64, freq, rate float64) float64 {
+	const samples = 48000
+	var inSquares, outSquares float64
+	for i := 0; i < samples; i++ {
+		x := math.Sin(2 * math.Pi * freq * float64(i) / rate)
+		y := process(0, x)
+		if i >= samples/2 {
+			inSquares += x * x
+			outSquares += y * y
+		}
+	}
+	return math.Sqrt(outSquares / inSquares)
+}
+
 func TestTransportConfigureKeepsEQFilterState(t *testing.T) {
 	samples := make([]pcmSample, 12000)
 	for i := range samples {

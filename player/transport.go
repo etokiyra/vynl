@@ -34,8 +34,10 @@ type transportStreamer struct {
 	pitch         float64
 	volume        float64
 	eq            [3]float64
-	lowState      [2]float64
-	upperState    [2]float64
+	lowStages     [2]biquad
+	highStages    [2]biquad
+	lowZ          [2][4]float64
+	highZ         [2][4]float64
 	sourceBase    float64
 	consumed      int
 	generated     int
@@ -48,8 +50,6 @@ type transportStreamer struct {
 	rms           float64
 	channelRMS    [2]float64
 	bassRMS       float64
-	lowAlpha      float64
-	upperAlpha    float64
 	analyzer      [analyzerSize]float32
 	analyzerPos   int
 }
@@ -108,12 +108,9 @@ func (s *transportStreamer) Stream(out [][2]float64) (int, bool) {
 			in := s.queue[s.queueOffset]
 			s.queueOffset++
 			for channel := 0; channel < 2; channel++ {
-				low := s.lowState[channel] + s.lowAlpha*(in[channel]-s.lowState[channel])
-				s.lowState[channel] = low
-				upper := s.upperState[channel] + s.upperAlpha*(in[channel]-s.upperState[channel])
-				s.upperState[channel] = upper
-				high := in[channel] - upper
-				mid := upper - low
+				low := s.processLow(channel, in[channel])
+				high := s.processHigh(channel, in[channel])
+				mid := in[channel] - low - high
 				value := softLimit((low*s.eq[0] + mid*s.eq[1] + high*s.eq[2]) * s.volume)
 				out[written][channel] = value
 				channelSquares[channel] += value * value
@@ -305,8 +302,8 @@ func (s *transportStreamer) Seek(seconds float64) {
 	s.queueOffset = 0
 	s.pending = nil
 	s.started = false
-	s.lowState = [2]float64{}
-	s.upperState = [2]float64{}
+	s.lowZ = [2][4]float64{}
+	s.highZ = [2][4]float64{}
 	s.ring.ensure(int64(math.Floor(target)))
 }
 
@@ -383,9 +380,71 @@ func (s *transportStreamer) remainingFramesFor(totalFrames int) int {
 
 func (s *transportStreamer) Buffering() bool { return s.buffering }
 
+// setFilterRates builds the fixed 3-way crossover filters. LOW and HIGH are
+// each Linkwitz-Riley 4th-order (two cascaded Butterworth biquad sections) so
+// the bands separate steeply while still summing back to the input at unity
+// gain: low + (in-low-high) + high == in exactly.
 func (s *transportStreamer) setFilterRates() {
-	s.lowAlpha = 1 - math.Exp(-2*math.Pi*250/s.rate)
-	s.upperAlpha = 1 - math.Exp(-2*math.Pi*4000/s.rate)
+	low := butterworthLowPass(250, s.rate)
+	s.lowStages = [2]biquad{low, low}
+	high := butterworthHighPass(4000, s.rate)
+	s.highStages = [2]biquad{high, high}
+}
+
+// processLow runs one sample through the cascaded low-pass sections for channel.
+func (s *transportStreamer) processLow(channel int, x float64) float64 {
+	z := &s.lowZ[channel]
+	x = s.lowStages[0].process(x, &z[0], &z[1])
+	return s.lowStages[1].process(x, &z[2], &z[3])
+}
+
+// processHigh runs one sample through the cascaded high-pass sections.
+func (s *transportStreamer) processHigh(channel int, x float64) float64 {
+	z := &s.highZ[channel]
+	x = s.highStages[0].process(x, &z[0], &z[1])
+	return s.highStages[1].process(x, &z[2], &z[3])
+}
+
+// biquad is a normalized second-order section in direct form II transposed. a1
+// and a2 are already divided by a0.
+type biquad struct {
+	b0, b1, b2, a1, a2 float64
+}
+
+func (b biquad) process(x float64, z1, z2 *float64) float64 {
+	y := b.b0*x + *z1
+	*z1 = b.b1*x - b.a1*y + *z2
+	*z2 = b.b2*x - b.a2*y
+	return y
+}
+
+// butterworthLowPass returns a normalized 2nd-order Butterworth low-pass at
+// frequency (Q = 1/sqrt(2), so 2Q = sqrt(2)).
+func butterworthLowPass(frequency, rate float64) biquad {
+	omega := 2 * math.Pi * frequency / rate
+	cosine, sine := math.Cos(omega), math.Sin(omega)
+	alpha := sine / math.Sqrt2
+	b0 := (1 - cosine) / 2
+	b1 := 1 - cosine
+	b2 := b0
+	a0 := 1 + alpha
+	a1 := -2 * cosine
+	a2 := 1 - alpha
+	return biquad{b0 / a0, b1 / a0, b2 / a0, a1 / a0, a2 / a0}
+}
+
+// butterworthHighPass returns a normalized 2nd-order Butterworth high-pass.
+func butterworthHighPass(frequency, rate float64) biquad {
+	omega := 2 * math.Pi * frequency / rate
+	cosine, sine := math.Cos(omega), math.Sin(omega)
+	alpha := sine / math.Sqrt2
+	b0 := (1 + cosine) / 2
+	b1 := -(1 + cosine)
+	b2 := b0
+	a0 := 1 + alpha
+	a1 := -2 * cosine
+	a2 := 1 - alpha
+	return biquad{b0 / a0, b1 / a0, b2 / a0, a1 / a0, a2 / a0}
 }
 
 func abs(value float64) float64 {
