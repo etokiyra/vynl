@@ -10,64 +10,73 @@ const (
 	grainSize = 2048
 	overlap   = 512
 	hop       = grainSize - overlap
+
+	// ringWindowFrames bounds the per-call source copy. It covers the playback
+	// callback (2048 output frames) plus grain/pitch worst cases (~19k frames);
+	// larger test buffers grow the scratch once, outside steady state.
+	ringWindowFrames = 32 * 1024
 )
 
 type sample = [2]float64
 type pcmSample [2]float32
 
 type transportStreamer struct {
-	buffer      *pcmBuffer
-	source      []pcmSample
-	totalFrames int
-	sourceDone  bool
-	buffering   bool
-	rate        float64
-	speed       float64
-	pitch       float64
-	volume      float64
-	eq          [3]float64
-	lowState    [2]float64
-	upperState  [2]float64
-	sourceBase  float64
-	consumed    int
-	generated   int
-	queue       []sample
-	queueOffset int
-	pending     []sample
-	grainBuf    []sample
-	started     bool
-	peak        float64
-	rms         float64
-	channelRMS  [2]float64
-	bassRMS     float64
-	lowAlpha    float64
-	upperAlpha  float64
-	analyzer    [analyzerSize]float32
-	analyzerPos int
+	ring          *pcmRing
+	source        []pcmSample // contiguous window of the ring covering this call
+	windowBase    int64       // absolute frame of source[0]
+	windowScratch []pcmSample // preallocated destination for the window copy
+	ringBlocked   bool        // ring could not serve the window this call
+	totalFrames   int
+	sourceDone    bool
+	buffering     bool
+	rate          float64
+	speed         float64
+	pitch         float64
+	volume        float64
+	eq            [3]float64
+	lowState      [2]float64
+	upperState    [2]float64
+	sourceBase    float64
+	consumed      int
+	generated     int
+	queue         []sample
+	queueOffset   int
+	pending       []sample
+	grainBuf      []sample
+	started       bool
+	peak          float64
+	rms           float64
+	channelRMS    [2]float64
+	bassRMS       float64
+	lowAlpha      float64
+	upperAlpha    float64
+	analyzer      [analyzerSize]float32
+	analyzerPos   int
 }
 
 func newTransportStreamer(source []pcmSample, sampleRate int) *transportStreamer {
-	return newBufferedTransportStreamer(newCompletePCMBuffer(source), sampleRate)
+	return newStreamingTransport(newCompletePCMRing(source), sampleRate)
 }
 
-func newBufferedTransportStreamer(source *pcmBuffer, sampleRate int) *transportStreamer {
+func newStreamingTransport(source *pcmRing, sampleRate int) *transportStreamer {
 	streamer := &transportStreamer{
-		buffer:   source,
-		rate:     float64(sampleRate),
-		speed:    1,
-		pitch:    1,
-		volume:   1,
-		eq:       [3]float64{1, 1, 1},
-		queue:    make([]sample, 0, grainSize),
-		pending:  make([]sample, 0, overlap),
-		grainBuf: make([]sample, grainSize),
+		ring:          source,
+		rate:          float64(sampleRate),
+		speed:         1,
+		pitch:         1,
+		volume:        1,
+		eq:            [3]float64{1, 1, 1},
+		queue:         make([]sample, 0, grainSize),
+		pending:       make([]sample, 0, overlap),
+		grainBuf:      make([]sample, grainSize),
+		windowScratch: make([]pcmSample, ringWindowFrames),
 	}
 	streamer.setFilterRates()
 	return streamer
 }
 
 func (s *transportStreamer) Stream(out [][2]float64) (int, bool) {
-	s.source, s.totalFrames, s.sourceDone, _ = s.buffer.snapshot()
+	s.refreshSource(len(out))
 	s.buffering = false
 	written := 0
 	peak := 0.0
@@ -85,7 +94,7 @@ func (s *transportStreamer) Stream(out [][2]float64) (int, bool) {
 			s.queueOffset = 0
 			if !s.generateGrain() {
 				s.updateLevels(peak, sumSquares, channelSquares, bassSquares, frameCount)
-				if !s.sourceDone {
+				if s.needsMoreData() {
 					s.buffering = true
 					for i := written; i < len(out); i++ {
 						out[i] = sample{}
@@ -145,15 +154,19 @@ func (s *transportStreamer) generateGrain() bool {
 	if s.remainingFrames() <= s.generated {
 		return false
 	}
+	if s.ringBlocked {
+		return false
+	}
 	nominal := s.sourceBase + float64(s.generated)*s.speed
-	if !s.sourceDone {
-		needed := nominal + float64(grainSize)*s.pitch
-		if s.started {
-			needed += 160
-		}
-		if needed >= float64(len(s.source)) {
-			return false
-		}
+	// The ring window must cover the whole grain before it is generated. When
+	// the producer has finished, the window is pinned to the track end and
+	// interpolate handles the final partial grain with silence, as before.
+	needed := nominal + float64(grainSize)*s.pitch
+	if s.started {
+		needed += ringMargin
+	}
+	if !s.sourceDone && needed >= float64(s.windowEnd()) {
+		return false
 	}
 	start := nominal
 	if s.started {
@@ -190,10 +203,10 @@ func (s *transportStreamer) alignGrain(nominal float64) float64 {
 	// Correlating the overlap against nearby source offsets reduces discontinuities at grain joins.
 	bestStart := nominal
 	bestScore := math.Inf(-1)
-	search := 160
+	search := ringMargin
 	for offset := -search; offset <= search; offset++ {
 		candidate := nominal + float64(offset)
-		if candidate < 0 || candidate+float64(overlap)*s.pitch >= float64(len(s.source)) {
+		if candidate < float64(s.windowBase) || candidate+float64(overlap)*s.pitch >= float64(s.windowEnd()) {
 			continue
 		}
 		score := 0.0
@@ -210,16 +223,58 @@ func (s *transportStreamer) alignGrain(nominal float64) float64 {
 }
 
 func (s *transportStreamer) interpolate(position float64) sample {
-	if position < 0 || position >= float64(len(s.source)-1) {
+	index := int(position) - int(s.windowBase)
+	if index < 0 || index+1 >= len(s.source) {
 		return sample{}
 	}
-	index := int(position)
-	fraction := position - float64(index)
+	fraction := position - float64(int(position))
 	first, second := s.source[index], s.source[index+1]
 	return sample{
 		float64(first[0]) + (float64(second[0])-float64(first[0]))*fraction,
 		float64(first[1]) + (float64(second[1])-float64(first[1]))*fraction,
 	}
+}
+
+// refreshSource publishes the consumer position and fetches the contiguous ring
+// window covering every grain this Stream call may generate.
+func (s *transportStreamer) refreshSource(outLen int) {
+	nominal := s.sourceBase + float64(s.generated)*s.speed
+	lo := int64(math.Floor(nominal))
+	if s.started {
+		lo -= ringMargin
+	}
+	if lo < 0 {
+		lo = 0
+	}
+	span := int64(math.Ceil(float64(outLen+2*hop)*s.speed)) + ringAheadWindow
+	scratch := s.windowScratch
+	if span > int64(len(scratch)) {
+		scratch = make([]pcmSample, span)
+		s.windowScratch = scratch
+	}
+	view := s.ring.window(lo, lo+span, scratch)
+	s.totalFrames = int(view.total)
+	s.sourceDone = view.finished
+	if !view.ready {
+		s.source = nil
+		s.windowBase = lo
+		s.ringBlocked = true
+		return
+	}
+	s.ringBlocked = false
+	s.source = view.samples
+	s.windowBase = view.base
+}
+
+// needsMoreData distinguishes "wait for the producer" from the real end of the
+// track. A blocked ring (seek rewrite in flight, or evicted data) takes the
+// same buffering path as a producer that has not decoded far enough yet.
+func (s *transportStreamer) needsMoreData() bool {
+	return s.ringBlocked || !s.sourceDone
+}
+
+func (s *transportStreamer) windowEnd() int64 {
+	return s.windowBase + int64(len(s.source))
 }
 
 func (s *transportStreamer) Configure(speed, pitch float64) {
@@ -233,10 +288,17 @@ func (s *transportStreamer) Configure(speed, pitch float64) {
 	s.queueOffset = 0
 	s.pending = nil
 	s.started = false
+	s.ring.ensure(int64(math.Floor(position)))
 }
 
 func (s *transportStreamer) Seek(seconds float64) {
-	s.sourceBase = clamp(seconds*s.rate, 0, float64(s.buffer.totalLength()))
+	target := seconds * s.rate
+	if _, total := s.ring.status(); total > 0 {
+		target = clamp(target, 0, float64(total))
+	} else if target < 0 {
+		target = 0
+	}
+	s.sourceBase = target
 	s.consumed = 0
 	s.generated = 0
 	s.queue = nil
@@ -245,16 +307,25 @@ func (s *transportStreamer) Seek(seconds float64) {
 	s.started = false
 	s.lowState = [2]float64{}
 	s.upperState = [2]float64{}
+	s.ring.ensure(int64(math.Floor(target)))
 }
 
 func (s *transportStreamer) SourcePosition() float64 {
-	return clamp(s.sourceBase+float64(s.consumed)*s.speed, 0, float64(s.buffer.totalLength()))
+	position := s.sourceBase + float64(s.consumed)*s.speed
+	if _, total := s.ring.status(); total > 0 && position > float64(total) {
+		position = float64(total)
+	}
+	if position < 0 {
+		position = 0
+	}
+	return position
 }
 
 func (s *transportStreamer) PositionSeconds() float64 { return s.SourcePosition() / s.rate }
 
 func (s *transportStreamer) DurationSeconds() float64 {
-	return float64(s.buffer.totalLength()) / s.rate
+	_, total := s.ring.status()
+	return float64(total) / s.rate
 }
 
 func (s *transportStreamer) Volume() float64 { return s.volume }
@@ -287,15 +358,26 @@ func (s *transportStreamer) CopyWaveform(dst []float32) {
 }
 
 func (s *transportStreamer) Done() bool {
-	_, totalFrames, done, _ := s.buffer.snapshot()
-	return done && s.consumed >= s.remainingFramesFor(totalFrames)
+	finished, total := s.ring.status()
+	if !finished {
+		return false
+	}
+	return s.consumed >= s.remainingFramesFor(int(total))
 }
 
 func (s *transportStreamer) remainingFrames() int {
 	return s.remainingFramesFor(s.totalFrames)
 }
 
+// remainingFramesFor treats an unknown length (0) as unbounded so a container
+// that does not report its length still plays until the producer finishes.
 func (s *transportStreamer) remainingFramesFor(totalFrames int) int {
+	if totalFrames <= 0 || float64(totalFrames) <= s.sourceBase {
+		if totalFrames <= 0 {
+			return math.MaxInt32
+		}
+		return 0
+	}
 	return int(math.Ceil((float64(totalFrames) - s.sourceBase) / s.speed))
 }
 

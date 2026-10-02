@@ -81,7 +81,7 @@ type Engine struct {
 	loading      bool
 	control      *beep.Ctrl
 	stream       *transportStreamer
-	source       *pcmBuffer
+	ring         *pcmRing
 	decodeCancel chan struct{}
 	decodeDone   chan struct{}
 	index        int
@@ -102,9 +102,38 @@ type Engine struct {
 	stop         chan struct{}
 	done         chan struct{}
 	closeOnce    sync.Once
+
+	// persistMu guards the race-free snapshot a non-engine goroutine (main, at
+	// shutdown) reads. It is never held while taking speaker.Lock or ring.mu,
+	// so it cannot affect the audio lock order.
+	persistMu sync.Mutex
+	persist   PersistState
 }
 
-func NewEngine(tracks []library.Track) (*Engine, error) {
+// InitialState carries the playback settings restored from the persisted state
+// file. It is expected to be fully populated; config.DefaultState()/LoadState
+// provide sane values.
+type InitialState struct {
+	Volume  float64
+	Muted   bool
+	EQ      [3]float64
+	Shuffle bool
+	Vinyl   bool
+	Repeat  RepeatMode
+}
+
+// PersistState is the subset of engine state that is remembered across runs.
+// It intentionally excludes the current track and playback position.
+type PersistState struct {
+	Volume  float64
+	Muted   bool
+	EQ      [3]float64
+	Shuffle bool
+	Vinyl   bool
+	Repeat  RepeatMode
+}
+
+func NewEngine(tracks []library.Track, initial InitialState) (*Engine, error) {
 	if len(tracks) == 0 {
 		return nil, errors.New("music library is empty")
 	}
@@ -113,14 +142,57 @@ func NewEngine(tracks []library.Track) (*Engine, error) {
 	}
 	e := &Engine{
 		tracks: tracks, commands: make(chan Command, 32), updates: make(chan Status, 1),
-		speed: 1, volume: 0.8, eq: [3]float64{1, 1, 1},
-		repeat: RepeatAll, order: newPlayOrder(len(tracks)),
+		speed:    1,
 		analyzer: newSpectrumAnalyzer(analyzerSize, outputRate),
 		stop:     make(chan struct{}), done: make(chan struct{}),
 	}
+	e.applyInitial(initial)
 	go e.run()
 	e.Send(Command{Action: Select, Value: 0})
 	return e, nil
+}
+
+// applyInitial sets the persisted settings and rebuilds the play order to match.
+// It runs before the engine goroutine starts, so it needs no locking.
+func (e *Engine) applyInitial(initial InitialState) {
+	e.volume = clamp(initial.Volume, 0, 1)
+	e.muted = initial.Muted
+	for i := range e.eq {
+		e.eq[i] = clamp(initial.EQ[i], 0, 2)
+	}
+	e.shuffle = initial.Shuffle
+	e.vinyl = initial.Vinyl
+	e.repeat = initial.Repeat
+	if e.repeat != RepeatOff && e.repeat != RepeatAll && e.repeat != RepeatOne {
+		e.repeat = RepeatAll
+	}
+	if e.speed == 0 {
+		e.speed = 1
+	}
+	e.order = newPlayOrder(len(e.tracks))
+	if e.shuffle {
+		e.order.shuffle()
+	}
+	e.updatePersist()
+}
+
+// updatePersist refreshes the cross-goroutine snapshot. Called on the engine
+// goroutine whenever persisted settings can change.
+func (e *Engine) updatePersist() {
+	e.persistMu.Lock()
+	e.persist = PersistState{
+		Volume: e.volume, Muted: e.muted, EQ: e.eq,
+		Shuffle: e.shuffle, Vinyl: e.vinyl, Repeat: e.repeat,
+	}
+	e.persistMu.Unlock()
+}
+
+// PersistState returns the latest persisted settings. Safe to call from any
+// goroutine; used by main on exit.
+func (e *Engine) PersistState() PersistState {
+	e.persistMu.Lock()
+	defer e.persistMu.Unlock()
+	return e.persist
 }
 
 func (e *Engine) Send(command Command) {
@@ -266,7 +338,7 @@ func (e *Engine) selectTrack(index int, autoplay bool) {
 	e.loading = true
 	e.control = nil
 	e.stream = nil
-	e.source = nil
+	e.ring = nil
 	e.publish()
 	track, err := openTrackDecoder(e.tracks[index].Path)
 	if err != nil {
@@ -290,12 +362,20 @@ func (e *Engine) selectTrack(index int, autoplay bool) {
 		e.publish()
 		return
 	}
-	source := newPCMBufferWithInitial(track.totalFrames, initial)
-	if !more {
-		source.finish(nil)
+	var ring *pcmRing
+	if more {
+		// Long track: bounded ring plus a background producer. The first
+		// second is written synchronously so playback can start immediately.
+		ring = newPCMRing(ringCapacityFrames)
+		ring.setTotal(int64(track.totalFrames))
+		ring.tryWrite(initial)
+	} else {
+		// Whole track already fits in the initial buffer: keep it complete and
+		// static, no producer needed (and seeks stay instant).
+		ring = newCompletePCMRing(initial)
 	}
-	e.source = source
-	e.stream = newBufferedTransportStreamer(source, outputRate)
+	e.ring = ring
+	e.stream = newStreamingTransport(ring, outputRate)
 	e.stream.SetVolume(e.effectiveVolume())
 	for band, value := range e.eq {
 		e.stream.SetEQ(band, value)
@@ -364,6 +444,7 @@ func (e *Engine) advanceTrack() {
 }
 
 func (e *Engine) publish() {
+	e.updatePersist()
 	status := Status{
 		Index: e.index, Count: len(e.tracks), Playing: e.playing,
 		Loading: e.loading, Speed: e.speed, Pitch: e.pitch, Volume: e.volume,
@@ -398,10 +479,9 @@ func (e *Engine) publish() {
 			status.Spectrum = e.spectrum
 		}
 	}
-	if e.source != nil {
-		_, _, _, sourceErr := e.source.snapshot()
-		if sourceErr != nil {
-			status.Err = sourceErr.Error()
+	if e.ring != nil {
+		if ringErr := e.ring.errValue(); ringErr != nil {
+			status.Err = ringErr.Error()
 		}
 	}
 	select {
@@ -424,6 +504,7 @@ type trackDecoder struct {
 	file        *os.File
 	stream      beep.StreamSeekCloser
 	resampled   *beep.Resampler
+	inRate      beep.SampleRate
 	totalFrames int
 }
 
@@ -459,6 +540,7 @@ func openTrackDecoder(path string) (*trackDecoder, error) {
 	return &trackDecoder{
 		file: file, stream: stream,
 		resampled:   beep.Resample(4, format.SampleRate, beep.SampleRate(outputRate), stream),
+		inRate:      format.SampleRate,
 		totalFrames: totalFrames,
 	}, nil
 }
@@ -492,6 +574,22 @@ func (d *trackDecoder) decodeInitial(target int) ([]pcmSample, bool, error) {
 	return initial, more, nil
 }
 
+// seekToOutputFrame repositions the decoder so the next decoded frame is the
+// given output-rate frame. beep's Resampler has no reset, so it is rebuilt;
+// this is the only place it is rebuilt, and only on a real decoder seek (never
+// on a within-window head move, which never touches the decoder).
+func (d *trackDecoder) seekToOutputFrame(frame int64) error {
+	native := int64(math.Round(float64(frame) * float64(d.inRate) / float64(outputRate)))
+	if native < 0 {
+		native = 0
+	}
+	if err := d.stream.Seek(int(native)); err != nil {
+		return err
+	}
+	d.resampled = beep.Resample(4, d.inRate, beep.SampleRate(outputRate), d.stream)
+	return nil
+}
+
 func appendPCM(destination []pcmSample, decoded []sample) []pcmSample {
 	for _, value := range decoded {
 		destination = append(destination, pcmSample{float32(value[0]), float32(value[1])})
@@ -503,42 +601,63 @@ func (e *Engine) startDecoder(track *trackDecoder) {
 	e.stopDecoder()
 	cancel := make(chan struct{})
 	done := make(chan struct{})
-	source := e.source
+	ring := e.ring
 	e.decodeCancel = cancel
 	e.decodeDone = done
 	go func() {
 		defer close(done)
 		defer track.close()
-		decoded := make([]sample, 4096)
+		decoded := make([]sample, ringChunkFrames)
+		chunk := make([]pcmSample, 0, ringChunkFrames)
 		for {
+			// The wake channel is only a hint: notify is dropped when its
+			// buffer is full. Re-checking here on *every* iteration (and again
+			// after every wait in tryWrite) guarantees a seek is processed even
+			// if a wake is lost, so progress never depends on receiving one.
+			if gen, frame, ok := ring.pendingSeek(); ok {
+				if err := track.seekToOutputFrame(frame); err != nil {
+					ring.finish(err)
+				} else {
+					ring.commitSeek(gen, frame)
+				}
+				continue
+			}
 			select {
 			case <-cancel:
-				source.finish(nil)
+				ring.finish(nil)
 				return
 			default:
+			}
+			if ring.isFinished() {
+				// Stay alive after EOF (or error) so Restart and backward seeks
+				// can resume decoding, then keep draining until we are stopped.
+				ring.wait(cancel)
+				continue
 			}
 			n, more := track.resampled.Stream(decoded)
-			chunk := appendPCM(make([]pcmSample, 0, n), decoded[:n])
 			if err := track.resampled.Err(); err != nil {
-				source.finish(err)
-				return
+				ring.finish(err)
+				continue
 			}
-			select {
-			case <-cancel:
-				source.finish(nil)
-				return
-			default:
+			if n == 0 && more {
+				ring.finish(errors.New("audio decoder made no progress"))
+				continue
 			}
-			if !source.append(chunk) {
-				return
+			chunk = appendPCM(chunk[:0], decoded[:n])
+			for !ring.tryWrite(chunk) {
+				if !ring.wait(cancel) {
+					ring.finish(nil)
+					return
+				}
+				if _, _, ok := ring.pendingSeek(); ok {
+					break
+				}
+			}
+			if _, _, ok := ring.pendingSeek(); ok {
+				continue
 			}
 			if !more {
-				source.finish(nil)
-				return
-			}
-			if n == 0 {
-				source.finish(errors.New("audio decoder made no progress"))
-				return
+				ring.finish(nil)
 			}
 		}
 	}()

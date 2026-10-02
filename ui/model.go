@@ -27,6 +27,11 @@ type tickMsg time.Time
 type statusMsg player.Status
 type trackDetailsMsg trackDetails
 
+// tagBatchMsg carries one batch of incremental tag metadata; tagScanDoneMsg is
+// emitted once when the scan stream closes.
+type tagBatchMsg []library.TagUpdate
+type tagScanDoneMsg struct{}
+
 // trackSort selects how the library list is ordered.
 type trackSort int
 
@@ -90,6 +95,13 @@ type Model struct {
 	deckFocused    bool
 	showHelp       bool
 	sortKey        trackSort
+
+	// tagUpdates is the asynchronous tag scan stream, if one is running.
+	// tagScanning drives the "SCANNING" indicator and tagScanned is its count.
+	// Both live only on the Bubble Tea event loop.
+	tagUpdates  <-chan []library.TagUpdate
+	tagScanning bool
+	tagScanned  int
 }
 
 func NewModel(tracks []library.Track, engine *player.Engine, cfg config.Config) Model {
@@ -102,8 +114,24 @@ func NewModel(tracks []library.Track, engine *player.Engine, cfg config.Config) 
 	return m
 }
 
+// WithTagUpdates attaches an incremental tag stream. The UI applies batches as
+// they arrive and shows a scanning indicator until the stream closes. It is a
+// separate method (not a NewModel parameter) so existing callers are unaffected.
+func (m Model) WithTagUpdates(updates <-chan []library.TagUpdate) Model {
+	m.tagUpdates = updates
+	m.tagScanning = updates != nil
+	return m
+}
+
 func (m Model) Init() tea.Cmd {
-	return waitForStatus(m.engine.Updates())
+	commands := make([]tea.Cmd, 0, 2)
+	if m.engine != nil {
+		commands = append(commands, waitForStatus(m.engine.Updates()))
+	}
+	if m.tagUpdates != nil {
+		commands = append(commands, waitForTags(m.tagUpdates))
+	}
+	return tea.Batch(commands...)
 }
 
 func (m Model) Update(message tea.Msg) (tea.Model, tea.Cmd) {
@@ -152,23 +180,34 @@ func (m Model) Update(message tea.Msg) (tea.Model, tea.Cmd) {
 			m.bassTarget = 0
 		}
 		commands := []tea.Cmd{waitForStatus(m.engine.Updates())}
-		if m.loaded.path != m.status.Track.Path {
+		track := m.currentTrack()
+		if m.loaded.path != track.Path {
 			// Reserve the path so repeated status updates do not queue duplicate
 			// reads, and load the header off the update loop: decoding a file on
 			// a slow or network-mounted library must not stall rendering.
-			m.loaded = trackDetails{path: m.status.Track.Path}
+			m.loaded = trackDetails{path: track.Path}
 			commands = append(commands,
-				loadTrackDetails(m.status.Track.Path),
-				tea.SetWindowTitle(windowTitle(m.status.Track)))
+				loadTrackDetails(track.Path),
+				tea.SetWindowTitle(windowTitle(track)))
 		}
 		if !wasPlaying && m.status.Playing {
 			commands = append(commands, tick())
 		}
 		return m, tea.Batch(commands...)
 	case trackDetailsMsg:
-		if details := trackDetails(msg); details.path == m.status.Track.Path {
+		if details := trackDetails(msg); details.path == m.currentTrack().Path {
 			m.loaded = details
 		}
+	case tagBatchMsg:
+		m.applyTagUpdates([]library.TagUpdate(msg))
+		if m.tagUpdates != nil {
+			return m, waitForTags(m.tagUpdates)
+		}
+	case tagScanDoneMsg:
+		// The stream is exhausted; clear the indicator regardless of the count
+		// so a late or missing final batch can never look stuck.
+		m.tagScanning = false
+		m.tagUpdates = nil
 	case tea.KeyMsg:
 		return m.updateKey(msg)
 	}
@@ -177,6 +216,11 @@ func (m Model) Update(message tea.Msg) (tea.Model, tea.Cmd) {
 
 func (m Model) updateKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	key := msg.String()
+	// Ctrl+C always quits, even mid-search or with the help overlay open, so it
+	// is a universal escape hatch and its exit path persists state.
+	if key == "ctrl+c" {
+		return m, tea.Quit
+	}
 	if m.searching {
 		switch key {
 		case "esc":
@@ -488,14 +532,14 @@ func padRight(text string, width int) string {
 func (m Model) deckPanel(width, height int, p palette) string {
 	inner := max(1, width-6)
 	title, artist := "No track loaded", "Scan a folder containing MP3, FLAC, WAV, or OGG files"
-	if m.status.Track.Path != "" {
-		title = m.status.Track.Title
-		artist = m.status.Track.Artist
+	if track := m.currentTrack(); track.Path != "" {
+		title = track.Title
+		artist = track.Artist
 		if artist == "" {
-			artist = m.status.Track.Album
+			artist = track.Album
 		}
 		if artist == "" {
-			artist = filepathBase(m.status.Track.Path)
+			artist = filepathBase(track.Path)
 		}
 	}
 	showVinyl := inner >= 52 && height >= 20
@@ -611,6 +655,9 @@ func (m Model) libraryPanel(width, height int, p palette) string {
 		end = start + maxTracks
 	}
 	header := fmt.Sprintf("%d/%d TRACKS  %s", len(m.visible), len(m.tracks), m.sortKey.label())
+	if m.tagScanning {
+		header += fmt.Sprintf("  SCANNING %d/%d", min(m.tagScanned, len(m.tracks)), len(m.tracks))
+	}
 	if query := strings.TrimSpace(m.search); query != "" {
 		header += "  FILTER: " + query
 	}
@@ -742,6 +789,38 @@ func (m *Model) refreshVisible() {
 	if m.selected >= len(m.visible) {
 		m.selected = max(0, len(m.visible)-1)
 	}
+}
+
+// applyTagUpdates replaces display metadata in place. It refreshes the visible
+// list at most once per batch, and skips the O(n log n) rebuild entirely when
+// the order cannot change (no search, sorted by path).
+func (m *Model) applyTagUpdates(updates []library.TagUpdate) {
+	identityOrder := m.search == "" && m.sortKey == sortByPath
+	for _, update := range updates {
+		if update.Index < 0 || update.Index >= len(m.tracks) {
+			continue
+		}
+		m.tracks[update.Index] = update.Track
+		m.tagScanned++
+	}
+	if identityOrder {
+		return
+	}
+	m.refreshVisible()
+}
+
+// currentTrack prefers the UI's own track list, which carries incremental tag
+// metadata, over the engine's fallback copy. It falls back to the status track
+// when nothing is loaded, so the deck still shows "No track loaded" at startup.
+// Paths are identical either way.
+func (m Model) currentTrack() library.Track {
+	if m.status.Track.Path == "" {
+		return m.status.Track
+	}
+	if m.status.Index >= 0 && m.status.Index < len(m.tracks) {
+		return m.tracks[m.status.Index]
+	}
+	return m.status.Track
 }
 
 // lessTrack orders two tracks by the active sort key, falling back to the path
@@ -1096,7 +1175,7 @@ func compactRoot(m Model, p palette) string {
 		return fixedBlock("VYNL", m.width, m.height, p.background)
 	}
 	innerWidth, innerHeight := m.width-2, m.height-2
-	track := m.status.Track.Title
+	track := m.currentTrack().Title
 	if track == "" {
 		track = "No track loaded"
 	}
@@ -1342,4 +1421,14 @@ func tick() tea.Cmd {
 
 func waitForStatus(updates <-chan player.Status) tea.Cmd {
 	return func() tea.Msg { return statusMsg(<-updates) }
+}
+
+func waitForTags(updates <-chan []library.TagUpdate) tea.Cmd {
+	return func() tea.Msg {
+		batch, ok := <-updates
+		if !ok {
+			return tagScanDoneMsg{}
+		}
+		return tagBatchMsg(batch)
+	}
 }

@@ -4,6 +4,7 @@ import (
 	"math"
 	"sync"
 	"testing"
+	"time"
 )
 
 func TestTransportSpeedControlsDuration(t *testing.T) {
@@ -69,26 +70,29 @@ func TestTransportReportsIndependentChannelAndBassLevels(t *testing.T) {
 	}
 }
 
-func TestBufferedTransportStreamsWhenContainerLengthIsUnknown(t *testing.T) {
-	initial := testTone(2048)
-	source := newPCMBufferWithInitial(0, initial)
-	if _, total, _, _ := source.snapshot(); total != len(initial) {
-		t.Fatalf("buffer total = %d, want at least %d", total, len(initial))
+func TestStreamingTransportPlaysUnknownLengthContainer(t *testing.T) {
+	ring := ringTestRing()
+	if !ring.tryWrite(testTone(4096)) {
+		t.Fatal("initial write rejected")
 	}
-	streamer := newBufferedTransportStreamer(source, 12000)
+	streamer := newStreamingTransport(ring, 12000)
 	output := make([]sample, 512)
-	if n, more := streamer.Stream(output); n != len(output) || !more {
-		t.Fatalf("unknown-length stream returned n=%d more=%t, want full output", n, more)
+	if n, more := streamer.Stream(output); n != len(output) || !more || streamer.Buffering() {
+		t.Fatalf("unknown-length stream returned n=%d more=%t buffering=%t, want full output", n, more, streamer.Buffering())
+	}
+	ring.finish(nil)
+	if got := streamer.DurationSeconds(); got <= 0 {
+		t.Fatalf("duration after finish = %.3f, want positive", got)
 	}
 }
 
-func TestBufferedTransportFreezesPositionDuringUnderflow(t *testing.T) {
-	initial := testTone(1024)
-	source := newPCMBufferWithInitial(12000, initial)
-	streamer := newBufferedTransportStreamer(source, 12000)
-	if got := streamer.DurationSeconds(); math.Abs(got-1) > 0.001 {
-		t.Fatalf("duration before decode completion = %.3f, want 1 second", got)
+func TestStreamingTransportBuffersWhenProducerIsBehind(t *testing.T) {
+	ring := ringTestRing()
+	ring.setTotal(12000)
+	if !ring.tryWrite(testTone(1024)) {
+		t.Fatal("initial write rejected")
 	}
+	streamer := newStreamingTransport(ring, 12000)
 	output := make([]sample, 512)
 	n, more := streamer.Stream(output)
 	if n != len(output) || !more || !streamer.Buffering() {
@@ -103,9 +107,10 @@ func TestBufferedTransportFreezesPositionDuringUnderflow(t *testing.T) {
 		t.Fatalf("position advanced during silence to %.3f seconds", got)
 	}
 
-	if !source.append(testTone(12000 - len(initial))) {
+	if !ring.tryWrite(testTone(12000 - 1024)) {
 		t.Fatal("failed to append decoded samples")
 	}
+	ring.finish(nil)
 	n, more = streamer.Stream(output)
 	if n != len(output) || !more || streamer.Buffering() {
 		t.Fatalf("resumed result = n:%d more:%t buffering:%t", n, more, streamer.Buffering())
@@ -115,59 +120,79 @@ func TestBufferedTransportFreezesPositionDuringUnderflow(t *testing.T) {
 	}
 }
 
-func TestBufferedTransportSeekWaitsWithoutAdvancing(t *testing.T) {
-	initial := testTone(3000)
-	source := newPCMBufferWithInitial(12000, initial)
-	streamer := newBufferedTransportStreamer(source, 12000)
-	streamer.Seek(0.5)
+func TestStreamingTransportSeekWaitsForDecoder(t *testing.T) {
+	ring := ringTestRing()
+	ring.setTotal(12000)
+	if !ring.tryWrite(testTone(3000)) {
+		t.Fatal("initial write rejected")
+	}
+	streamer := newStreamingTransport(ring, 12000)
+	streamer.Seek(0.5) // output frame 6000, beyond decoded data
 	output := make([]sample, 512)
 	streamer.Stream(output)
 	if !streamer.Buffering() {
-		t.Fatal("seek beyond decoded prefix should report buffering")
+		t.Fatal("seek beyond decoded data should report buffering")
 	}
 	if got := streamer.PositionSeconds(); math.Abs(got-0.5) > 0.001 {
 		t.Fatalf("position during seek buffering = %.3f, want 0.5", got)
 	}
-	if !source.append(testTone(12000 - len(initial))) {
+	gen, frame, ok := ring.pendingSeek()
+	if !ok || frame != 6000 {
+		t.Fatalf("pending seek = (%d, %d, %t), want frame 6000", gen, frame, ok)
+	}
+	ring.commitSeek(gen, frame)
+	if !ring.tryWrite(testTone(12000 - 6000)) {
 		t.Fatal("failed to append seek target samples")
 	}
+	ring.finish(nil)
 	streamer.Stream(output)
 	if streamer.Buffering() || streamer.PositionSeconds() <= 0.5 {
 		t.Fatalf("seek did not resume: buffering:%t position:%.3f", streamer.Buffering(), streamer.PositionSeconds())
 	}
 }
 
-func TestPCMBufferSupportsConcurrentStreamingAndAppend(t *testing.T) {
+func TestStreamingTransportConsumesRingWithoutLoss(t *testing.T) {
 	const totalFrames = 131072
+	ring := ringTestRing()
+	ring.setTotal(totalFrames)
 	initial := testTone(2048)
-	source := newPCMBufferWithInitial(totalFrames, initial)
-	streamer := newBufferedTransportStreamer(source, 12000)
-	start := make(chan struct{})
-	var writer sync.WaitGroup
-	writer.Add(1)
+	if !ring.tryWrite(initial) {
+		t.Fatal("initial write rejected")
+	}
+	streamer := newStreamingTransport(ring, 12000)
+	cancel := make(chan struct{})
+	var producer sync.WaitGroup
+	producer.Add(1)
 	go func() {
-		defer writer.Done()
-		<-start
+		defer producer.Done()
 		for remaining := totalFrames - len(initial); remaining > 0; {
-			chunkSize := min(4096, remaining)
-			if !source.append(testTone(chunkSize)) {
-				return
+			chunkSize := min(ringChunkFrames, remaining)
+			chunk := testTone(chunkSize)
+			for !ring.tryWrite(chunk) {
+				if !ring.wait(cancel) {
+					return
+				}
 			}
 			remaining -= chunkSize
 		}
-		source.finish(nil)
+		ring.finish(nil)
 	}()
-	close(start)
+
 	output := make([]sample, 257)
+	deadline := time.Now().Add(30 * time.Second)
 	for {
 		_, more := streamer.Stream(output)
 		if !more {
 			break
 		}
+		if time.Now().After(deadline) {
+			t.Fatal("timed out consuming the ring")
+		}
 	}
-	writer.Wait()
+	close(cancel)
+	producer.Wait()
 	if got := streamer.consumed; got != totalFrames {
-		t.Fatalf("consumed %d frames after concurrent append, want %d", got, totalFrames)
+		t.Fatalf("consumed %d frames after streaming, want %d", got, totalFrames)
 	}
 }
 
@@ -238,6 +263,47 @@ func TestTransportStreamsWithoutAllocating(t *testing.T) {
 	}); allocs != 0 {
 		t.Fatalf("Stream allocated %.2f times per call in steady state, want 0", allocs)
 	}
+}
+
+// TestStreamingTransportStreamsWithoutAllocating runs the same allocation check
+// on the producer-backed ring path, where the window copy must also stay
+// allocation-free.
+func TestStreamingTransportStreamsWithoutAllocating(t *testing.T) {
+	ring := ringTestRing()
+	ring.setTotal(1 << 30)
+	if !ring.tryWrite(makeRamp(0, ringTestCapacity)) {
+		t.Fatal("initial write rejected")
+	}
+	cancel := make(chan struct{})
+	var producer sync.WaitGroup
+	producer.Add(1)
+	go func() {
+		defer producer.Done()
+		pos := int64(ringTestCapacity)
+		chunk := make([]pcmSample, ringChunkFrames)
+		for {
+			for i := range chunk {
+				chunk[i] = rampFrame(pos + int64(i))
+			}
+			for !ring.tryWrite(chunk) {
+				if !ring.wait(cancel) {
+					return
+				}
+			}
+			pos += int64(len(chunk))
+		}
+	}()
+
+	streamer := newStreamingTransport(ring, 12000)
+	output := make([]sample, 512)
+	streamer.Stream(output) // warm the window scratch and grain buffers
+	if allocs := testing.AllocsPerRun(200, func() {
+		streamer.Stream(output)
+	}); allocs != 0 {
+		t.Fatalf("ring-backed Stream allocated %.2f times per call, want 0", allocs)
+	}
+	close(cancel)
+	producer.Wait()
 }
 
 func testTone(length int) []pcmSample {

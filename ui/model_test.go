@@ -733,6 +733,123 @@ func TestSpectrumScanlineMovesAcrossColumns(t *testing.T) {
 	}
 }
 
+func TestCtrlCQuitsEvenWhileSearchingOrHelpOpen(t *testing.T) {
+	model := NewModel(nil, nil, config.Defaults())
+	setups := []struct {
+		name  string
+		apply func(*Model)
+	}{
+		{"deck", func(*Model) {}},
+		{"search", func(m *Model) { m.searching = true }},
+		{"help", func(m *Model) { m.showHelp = true }},
+	}
+	for _, setup := range setups {
+		t.Run(setup.name, func(t *testing.T) {
+			m := model
+			setup.apply(&m)
+			_, command := m.Update(tea.KeyMsg{Type: tea.KeyCtrlC})
+			if command == nil {
+				t.Fatal("ctrl+c did not return a command")
+			}
+			if _, ok := command().(tea.QuitMsg); !ok {
+				t.Fatal("ctrl+c did not produce a quit")
+			}
+		})
+	}
+}
+
+func TestTagBatchAppliesUpdatesInPlace(t *testing.T) {
+	tracks := []library.Track{
+		{Path: "a.flac", Title: "a"},
+		{Path: "b.flac", Title: "b"},
+	}
+	model := NewModel(tracks, nil, config.Defaults())
+	model.sortKey = sortByTitle
+	updated, _ := model.Update(tagBatchMsg([]library.TagUpdate{
+		{Index: 1, Track: library.Track{Path: "b.flac", Title: "Zed", Artist: "Artist"}},
+	}))
+	got := updated.(Model)
+	if got.tracks[1].Title != "Zed" || got.tracks[1].Artist != "Artist" {
+		t.Fatalf("tag update not applied in place: %+v", got.tracks[1])
+	}
+	if got.tagScanned != 1 {
+		t.Fatalf("tagScanned = %d, want 1", got.tagScanned)
+	}
+}
+
+func TestTagUpdatesAdvanceProgressToTotalThenClear(t *testing.T) {
+	tracks := []library.Track{
+		{Path: "a.mp3", Title: "a"},
+		{Path: "b.mp3", Title: "b"},
+		{Path: "c.mp3", Title: "c"},
+	}
+	model := NewModel(tracks, nil, config.Defaults()).WithTagUpdates(make(chan []library.TagUpdate))
+	updates := make([]library.TagUpdate, len(tracks))
+	for i := range tracks {
+		updates[i] = library.TagUpdate{Index: i, Track: library.Track{Path: tracks[i].Path, Title: "tagged"}}
+	}
+	updated, _ := model.Update(tagBatchMsg(updates))
+	got := updated.(Model)
+	if got.tagScanned != len(tracks) {
+		t.Fatalf("tagScanned = %d, want %d", got.tagScanned, len(tracks))
+	}
+	updated, _ = got.Update(tagScanDoneMsg{})
+	if updated.(Model).tagScanning {
+		t.Fatal("tagScanDoneMsg did not clear the scanning indicator")
+	}
+}
+
+func TestWithTagUpdatesEnablesScanning(t *testing.T) {
+	model := NewModel(nil, nil, config.Defaults()).WithTagUpdates(make(chan []library.TagUpdate))
+	if !model.tagScanning || model.tagUpdates == nil {
+		t.Fatal("WithTagUpdates did not enable scanning")
+	}
+}
+
+func TestScanningIndicatorRendersInLibraryHeader(t *testing.T) {
+	tracks := []library.Track{{Path: "a.mp3", Title: "A"}, {Path: "b.mp3", Title: "B"}}
+	model := NewModel(tracks, nil, config.Defaults())
+	model.width, model.height = 120, 32
+	model.status = player.Status{Track: tracks[0], Count: 2, Playing: true, Speed: 1, Volume: 0.8}
+	model.tagScanning = true
+	model.tagScanned = 1
+	if view := model.View(); !strings.Contains(view, "SCANNING 1/2") {
+		t.Fatal("scanning indicator missing from the rendered view")
+	}
+}
+
+func TestCurrentTrackPrefersScannedMetadata(t *testing.T) {
+	tracks := []library.Track{{Path: "a.mp3", Title: "fallback-a"}}
+	model := NewModel(tracks, nil, config.Defaults())
+	model.status = player.Status{Track: tracks[0], Index: 0, Count: 1}
+	model.tracks[0] = library.Track{Path: "a.mp3", Title: "Tagged", Artist: "The Artist"}
+	got := model.currentTrack()
+	if got.Title != "Tagged" || got.Artist != "The Artist" {
+		t.Fatalf("currentTrack = %+v, want tagged metadata", got)
+	}
+}
+
+func TestCurrentTrackFallsBackWhenNothingLoaded(t *testing.T) {
+	tracks := []library.Track{{Path: "a.mp3", Title: "a"}}
+	model := NewModel(tracks, nil, config.Defaults())
+	if got := model.currentTrack(); got.Path != "" {
+		t.Fatalf("currentTrack = %+v, want empty before a track is loaded", got)
+	}
+}
+
+func TestWaitForTagsReportsBatchThenDone(t *testing.T) {
+	channel := make(chan []library.TagUpdate, 1)
+	channel <- []library.TagUpdate{{Index: 0, Track: library.Track{Path: "a"}}}
+	message := waitForTags(channel)()
+	if batch, ok := message.(tagBatchMsg); !ok || len(batch) != 1 {
+		t.Fatalf("waitForTags returned %T %+v, want one-item tagBatchMsg", message, message)
+	}
+	close(channel)
+	if _, ok := waitForTags(channel)().(tagScanDoneMsg); !ok {
+		t.Fatal("closed tag stream did not report tagScanDoneMsg")
+	}
+}
+
 func TestRMSAnimationEasesToRestAfterPause(t *testing.T) {
 	model := NewModel(nil, nil, config.Defaults())
 	model.status.Playing = true

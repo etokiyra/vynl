@@ -1,11 +1,14 @@
 package main
 
 import (
+	"context"
+	"errors"
 	"flag"
 	"fmt"
 	"log"
 	"os"
 	"path/filepath"
+	"runtime"
 
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/etokiyra/vynl/config"
@@ -31,22 +34,70 @@ func main() {
 		cfg.MusicDir = config.ExpandHome(*musicDir)
 	}
 
-	tracks, err := library.Scan(cfg.MusicDir)
+	statePath := config.StatePath(path)
+	state, stateErr := config.LoadState(statePath)
+	if stateErr != nil {
+		fmt.Fprintf(os.Stderr, "vynl: ignoring unreadable state file %s: %v\n", statePath, stateErr)
+	}
+
+	paths, err := library.ScanPaths(cfg.MusicDir)
 	if err != nil {
 		log.Fatal(err)
 	}
-	if len(tracks) == 0 {
+	if len(paths) == 0 {
 		fmt.Fprintf(os.Stderr, "No supported tracks found in %s\n", filepath.Clean(cfg.MusicDir))
 		return
 	}
+	tracks := library.FallbackTracks(paths)
 
-	engine, err := player.NewEngine(tracks)
+	engine, err := player.NewEngine(tracks, player.InitialState{
+		Volume:  state.Volume,
+		Muted:   state.Muted,
+		EQ:      state.EQ,
+		Shuffle: state.Shuffle,
+		Vinyl:   state.Vinyl,
+		Repeat:  player.RepeatMode(state.Repeat),
+	})
 	if err != nil {
 		log.Fatal(err)
 	}
 	defer engine.Close()
-	program := tea.NewProgram(ui.NewModel(tracks, engine, cfg), tea.WithAltScreen())
-	if _, err := program.Run(); err != nil {
-		log.Print(err)
+
+	// Read tags off the UI thread and stream them into the event loop. The scan
+	// stops when the program exits: any quit path cancels this context.
+	scanCtx, stopScan := context.WithCancel(context.Background())
+	defer stopScan()
+	tagUpdates := library.ReadTags(scanCtx, paths, runtime.NumCPU())
+
+	program := tea.NewProgram(
+		ui.NewModel(tracks, engine, cfg).WithTagUpdates(tagUpdates),
+		tea.WithAltScreen(),
+	)
+	_, runErr := program.Run()
+
+	// Persist on every exit path: the quit key, Ctrl+C, and SIGINT/SIGTERM
+	// (Bubble Tea turns those into a clean Run return or ErrInterrupted). This
+	// runs on the main goroutine, not the UI thread, and reads a race-free
+	// engine snapshot.
+	persistState(engine, statePath)
+
+	if runErr != nil && !errors.Is(runErr, tea.ErrInterrupted) {
+		log.Print(runErr)
+	}
+}
+
+// persistState writes the engine's latest playback settings beside the config.
+func persistState(engine *player.Engine, path string) {
+	snapshot := engine.PersistState()
+	state := config.State{
+		Volume:  snapshot.Volume,
+		Muted:   snapshot.Muted,
+		EQ:      snapshot.EQ,
+		Shuffle: snapshot.Shuffle,
+		Vinyl:   snapshot.Vinyl,
+		Repeat:  string(snapshot.Repeat),
+	}
+	if err := config.SaveState(path, state); err != nil {
+		fmt.Fprintf(os.Stderr, "vynl: could not save playback state: %v\n", err)
 	}
 }

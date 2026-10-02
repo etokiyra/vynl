@@ -46,7 +46,8 @@ transparent terminals like kitty, foot, or Alacritty.
 - 🔀 **Shuffle, repeat & transport** — shuffle the play order, cycle repeat
   off / all / one, and mute, restart, or seek from the keyboard
 - 📚 **Local library browser** — scans a folder for supported formats, reads
-  tags, fuzzy search, sortable browsing, and a preview of the next track
+  tags off the UI thread (so startup is not blocked), fuzzy search, sortable
+  browsing, and a preview of the next track
 - 🔊 **Stereo L/R level meters** and live track metadata (format, bitrate,
   sample rate, file size)
 - ⌨️ **Discoverable keymap** — context-sensitive footer hints plus a full-screen
@@ -57,6 +58,8 @@ transparent terminals like kitty, foot, or Alacritty.
   terminal's own theme and opacity show through
 - ⚙️ **Configurable** — music directory, foreground/accent colors, and
   keybindings via a TOML config file
+- 💾 **Remembers your settings** — volume, mute, EQ, shuffle, vinyl, and repeat
+  are restored on the next run from a separate `state.toml`
 
 ---
 
@@ -116,6 +119,7 @@ vynl -config /path/to/config.toml
 | `/`           | Search library                   |
 | `O`           | Cycle sort: path → title → artist → album |
 | `?`           | Show the full keybinding help    |
+| `Ctrl+C`      | Quit (always, even while searching) |
 | `Q`           | Quit                              |
 
 > `↑` / `↓` change volume while the deck has focus and browse the library while
@@ -170,6 +174,23 @@ fixed, and keys that VYNL does not recognize are accepted but ignored. Every
 `[keybindings]` entry above is honored except the fixed EQ keys (`1`/`2`/`3` and
 `+`/`-`/`=`).
 
+VYNL also remembers your volume, mute, EQ, shuffle, vinyl, and repeat settings
+across runs. It writes them to a separate `state.toml` beside the config file
+(same directory), so your hand-edited `config.toml` is never rewritten. The
+state file is small TOML:
+
+```toml
+volume = 0.8
+muted = false
+eq = [1.0, 1.0, 1.0]
+shuffle = false
+vinyl = false
+repeat = 'all'
+```
+
+A missing state file just uses the defaults; a malformed one is ignored with a
+one-line warning and the defaults are used.
+
 ---
 
 ## How it works
@@ -179,10 +200,11 @@ VYNL is built around a few core pieces:
 - **`player/`** — the audio engine. Wraps format-specific decoders
   (`mp3`/`flac`/`wav`/`vorbis` via `beep`) behind a custom `transportStreamer`
   that applies live speed, pitch, volume, and EQ per sample and ends in a soft
-  limiter. `pcm_buffer.go` is the thread-safe PCM store, `order.go` owns
-  shuffle/repeat, and `spectrum.go` is the FFT analyzer.
-- **`library/`** — scans the configured music directory, reads tags in
-  parallel, and builds the track list the UI browses.
+  limiter. `pcm_ring.go` is the bounded, thread-safe decoded-PCM ring,
+  `order.go` owns shuffle/repeat, and `spectrum.go` is the FFT analyzer.
+- **`library/`** — walks the configured music directory (fast, metadata only)
+  and reads tags in parallel off the UI thread, streaming the track list in as
+  results arrive.
 - **`ui/`** — the Bubble Tea model driving the deck, visualizer, vinyl
   animation, and library browser, all synced to a single tick loop.
 - **`config/`** — TOML config loading with sensible defaults when no config
@@ -201,13 +223,19 @@ command/status channels.
 
 ## Known limitations
 
-- The full decoded audio for the current track is kept in memory, so very long
-  files (multi-hour mixes) use a significant amount of RAM
+- Decoded audio is held in a fixed ~4-second ring (about 1.35 MiB) instead of
+  the whole track, so long files no longer use significant RAM. The tradeoff is
+  that a distant seek waits for the decoder to reposition and refill, which
+  shows as brief buffering; seeks inside the resident window are instant
 - The 3-band EQ is two one-pole low-passes (with a soft limiter); it is
   effective but gentle, and gentler than biquad shelving filters would be
-- Volume, mute, EQ, shuffle, vinyl, and repeat are not persisted between runs
-- Startup tag scanning runs before the UI appears; it is parallelized, but
-  extremely large libraries may still pause briefly
+- Volume, mute, EQ, shuffle, vinyl, and repeat are saved to a separate
+  `state.toml` and restored on the next run; a corrupt state file falls back to
+  defaults with a warning. The current track and playback position are not
+  restored
+- The directory walk runs before the UI appears (metadata only, no file opens);
+  tag reading is off the UI thread, so the list shows filename titles first and
+  fills in metadata live with a `SCANNING` indicator
 - Unreadable folders inside the music directory are skipped during the scan;
   the rest of the library still loads
 - Extreme speed/pitch settings can introduce minor artifacts on
@@ -224,13 +252,14 @@ order.
 
 ### Near term
 
-- [ ] **Bound the PCM memory** — replace the unbounded per-track buffer with a
-      seekable ring that re-seeks the decoder on backward jumps, so multi-hour
-      files no longer use gigabytes of RAM
-- [ ] **Persist playback state** — remember volume, mute, EQ, shuffle, vinyl,
-      and repeat across runs
-- [ ] **Async library scan** — read tags off the UI thread with a progress
-      indicator instead of blocking startup
+- [x] **Bound the PCM memory** — decoded audio now lives in a fixed 4-second
+      ring (~1.35 MiB); the decoder is a flow-controlled producer that re-seeks
+      on out-of-window jumps, so multi-hour files no longer use gigabytes of RAM
+- [x] **Persist playback state** — volume, mute, EQ, shuffle, vinyl, and repeat
+      are saved to a separate `state.toml` and restored across runs
+- [x] **Async library scan** — tag reading runs off the UI thread and streams
+      into the list with a `SCANNING` progress indicator, so startup is not
+      blocked by metadata parsing
 - [ ] **Rescan library** — reload the track list without restarting
 - [ ] **Auto-skip corrupt tracks** — advance past files that fail to decode
       instead of stalling
