@@ -782,6 +782,9 @@ func (m Model) deckPanel(width, height int, p palette) string {
 		}
 		modes = append(modes, rg)
 	}
+	if ms := m.config.Playback.CrossfadeMS; ms > 0 {
+		modes = append(modes, fmt.Sprintf("XFADE %.1fs", float64(ms)/1000))
+	}
 	baseLines = append(baseLines, marker+"  "+p.muted.Render(strings.Join(modes, "  ")))
 	baseLines = append(baseLines, p.text.Render(truncate(controlText, inner, "~")))
 	if m.status.Err != "" {

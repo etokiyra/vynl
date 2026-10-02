@@ -5,6 +5,7 @@ import (
 	"math"
 	"os"
 	"path/filepath"
+	"sync"
 	"testing"
 	"time"
 
@@ -13,75 +14,64 @@ import (
 	"github.com/gopxl/beep/speaker"
 )
 
-func TestDecoderPrebuffersThenCompletesTrackInBackground(t *testing.T) {
+func TestOpenTrackStreamPrebuffersThenCompletesInBackground(t *testing.T) {
 	const seconds = 3
 	const sampleRate = 44100
 	path := writeTestWAV(t, seconds, sampleRate)
-	track, err := openTrackDecoder(path)
+
+	// The initial buffer is one second: enough to start immediately, less than
+	// the whole track.
+	decoder, err := openTrackDecoder(path)
 	if err != nil {
 		t.Fatal(err)
 	}
-	initial, more, err := track.decodeInitial(initialBufferFrames)
+	initial, more, err := decoder.decodeInitial(initialBufferFrames)
 	if err != nil {
-		track.close()
+		decoder.close()
 		t.Fatal(err)
 	}
 	if !more {
-		track.close()
+		decoder.close()
 		t.Fatal("decoder unexpectedly reached EOF during the initial buffer")
 	}
 	if len(initial) < initialBufferFrames || len(initial) >= seconds*outputRate {
-		track.close()
+		decoder.close()
 		t.Fatalf("initial sample count = %d, want at least %d and less than full track", len(initial), initialBufferFrames)
 	}
-	ring := newPCMRing(ringCapacityFrames)
-	ring.setTotal(int64(track.totalFrames))
-	if !ring.tryWrite(initial) {
-		track.close()
-		t.Fatal("initial write rejected")
+	decoder.close()
+
+	stream, err := openTrackStream(0, path)
+	if err != nil {
+		t.Fatal(err)
 	}
-	streamer := newStreamingTransport(ring, outputRate)
-	if got := streamer.DurationSeconds(); got != seconds {
-		track.close()
+	defer stream.close()
+	if got := stream.transport.DurationSeconds(); got != seconds {
 		t.Fatalf("known duration = %.2f seconds, want %d", got, seconds)
 	}
-	engine := &Engine{ring: ring}
-	engine.startDecoder(track)
-	waitForRing(t, ring)
-	engine.stopDecoder()
-	if _, total := ring.status(); total != seconds*outputRate {
-		t.Fatalf("background decode ended with total %d, want %d", total, seconds*outputRate)
+	if stream.ring.capacityFrames() != ringCapacityFrames {
+		t.Fatalf("ring capacity = %d, want %d", stream.ring.capacityFrames(), ringCapacityFrames)
 	}
-	if ring.capacityFrames() != ringCapacityFrames {
-		t.Fatalf("ring capacity = %d, want %d", ring.capacityFrames(), ringCapacityFrames)
+	waitForRing(t, stream.ring)
+	if _, total := stream.ring.status(); total != seconds*outputRate {
+		t.Fatalf("background decode ended with total %d, want %d", total, seconds*outputRate)
 	}
 }
 
-func TestDecoderWorkerIsJoinedBeforeTrackReplacement(t *testing.T) {
+func TestTrackStreamCloseJoinsProducer(t *testing.T) {
 	path := writeTestWAV(t, 20, 44100)
-	track, err := openTrackDecoder(path)
+	stream, err := openTrackStream(0, path)
 	if err != nil {
 		t.Fatal(err)
 	}
-	initial, _, err := track.decodeInitial(initialBufferFrames)
-	if err != nil {
-		track.close()
-		t.Fatal(err)
+	stream.close()
+	if stream.cancel != nil || stream.done != nil {
+		t.Fatal("producer handles remain set after close")
 	}
-	ring := newPCMRing(ringCapacityFrames)
-	ring.setTotal(int64(track.totalFrames))
-	ring.tryWrite(initial)
-	engine := &Engine{ring: ring}
-	engine.startDecoder(track)
-	engine.stopDecoder()
-	if engine.decodeCancel != nil || engine.decodeDone != nil {
-		t.Fatal("decoder handles remain set after cancel-and-join")
+	if !stream.ring.isFinished() {
+		t.Fatal("closed stream did not finish its ring")
 	}
-	if !ring.isFinished() {
-		t.Fatal("cancelled decoder did not finish its ring")
-	}
-	if ring.capacityFrames() != ringCapacityFrames {
-		t.Fatalf("old track ring changed capacity to %d after worker join", ring.capacityFrames())
+	if stream.ring.capacityFrames() != ringCapacityFrames {
+		t.Fatalf("ring capacity changed to %d after close", stream.ring.capacityFrames())
 	}
 }
 
@@ -96,32 +86,20 @@ func waitForRing(t *testing.T, ring *pcmRing) {
 	}
 }
 
-// TestEngineDecoderSeeksAndResumesThroughRing plays far enough that the
-// producer wraps the bounded ring, then seeks back to the start (beyond the
-// retained window). That must trigger a real decoder re-seek and route through
-// the buffering path until the producer acks, after which playback resumes.
-func TestEngineDecoderSeeksAndResumesThroughRing(t *testing.T) {
+// TestStreamSeeksAndResumesThroughRing plays far enough that the producer wraps
+// the bounded ring, then seeks back to the start (beyond the retained window).
+// That must trigger a real decoder re-seek and route through the buffering path
+// until the producer acks, after which playback resumes.
+func TestStreamSeeksAndResumesThroughRing(t *testing.T) {
 	const seconds = 6 // 264,600 frames, larger than the 176,400-frame ring
 	path := writeTestWAV(t, seconds, 44100)
-	track, err := openTrackDecoder(path)
+	stream, err := openTrackStream(0, path)
 	if err != nil {
 		t.Fatal(err)
 	}
-	initial, more, err := track.decodeInitial(initialBufferFrames)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if !more {
-		t.Fatal("decoder unexpectedly reached EOF during the initial buffer")
-	}
-	ring := newPCMRing(ringCapacityFrames)
-	ring.setTotal(int64(track.totalFrames))
-	ring.tryWrite(initial)
-	engine := &Engine{ring: ring}
-	engine.startDecoder(track)
-	defer engine.stopDecoder()
-
-	streamer := newStreamingTransport(ring, outputRate)
+	defer stream.close()
+	ring := stream.ring
+	streamer := stream.transport
 	output := make([]sample, 2048)
 
 	// Drive the whole track through the ring. The producer can only finish
@@ -202,7 +180,7 @@ func TestSelectTrackSkipsUnplayableTracks(t *testing.T) {
 	if status.SampleRate != 44100 {
 		t.Fatalf("status sample rate = %d, want 44100 from the loaded file", status.SampleRate)
 	}
-	engine.stopDecoder()
+	engine.shutdownStreams()
 }
 
 // TestSelectTrackParksWhenEveryTrackFails checks the bound: an all-corrupt
@@ -230,7 +208,7 @@ func TestSelectTrackParksWhenEveryTrackFails(t *testing.T) {
 	if engine.errText == "" {
 		t.Fatal("no error surfaced after every track failed")
 	}
-	if engine.control != nil || engine.stream != nil {
+	if engine.current != nil || engine.queue.primary != nil {
 		t.Fatal("engine left audio state set after total load failure")
 	}
 	if engine.skipped != 0 {
@@ -261,7 +239,8 @@ func TestSelectTrackDoesNotSkipWithoutAutoplay(t *testing.T) {
 }
 
 // engineWithTracks builds a minimal, actor-free engine for load-path tests. Its
-// play order is initialized because selectTrack drives it directly.
+// play order is initialized and its queue/control are in place because
+// selectTrack drives them directly.
 func engineWithTracks(t *testing.T, tracks []library.Track) *Engine {
 	t.Helper()
 	engine := &Engine{
@@ -270,6 +249,8 @@ func engineWithTracks(t *testing.T, tracks []library.Track) *Engine {
 		speed:    1,
 		analyzer: newSpectrumAnalyzer(analyzerSize, outputRate),
 	}
+	engine.queue = newQueueStreamer()
+	engine.control = &beep.Ctrl{Streamer: engine.queue}
 	engine.order = newPlayOrder(len(tracks))
 	return engine
 }
@@ -664,6 +645,293 @@ func TestApplyInitialStoresEQCrossover(t *testing.T) {
 	engine.applyInitial(InitialState{EQLowHz: 300, EQHighHz: 3000})
 	if engine.eqLowHz != 300 || engine.eqHighHz != 3000 {
 		t.Fatalf("crossover = %v/%v, want 300/3000", engine.eqLowHz, engine.eqHighHz)
+	}
+}
+
+// driveQueue streams the queue until cond is true, failing on a timeout. It
+// simulates the audio callback without a device.
+func driveQueue(t *testing.T, engine *Engine, cond func() bool) {
+	t.Helper()
+	out := make([]sample, 1024)
+	deadline := time.Now().Add(10 * time.Second)
+	for !cond() {
+		engine.queue.Stream(out)
+		if time.Now().After(deadline) {
+			t.Fatal("timed out driving the queue")
+		}
+	}
+}
+
+// TestEngineGaplessPromotionAdvancesState checks the engine side of a gapless
+// boundary: when the queue promotes the prefetched track, reconcile adopts it,
+// updates the index and NEXT, and prefetches onward.
+func TestEngineGaplessPromotionAdvancesState(t *testing.T) {
+	first := writeTestWAV(t, 1, 44100)
+	second := writeTestWAV(t, 2, 44100)
+	engine := engineWithTracks(t, []library.Track{{Path: first}, {Path: second}})
+	t.Cleanup(engine.shutdownStreams)
+	engine.repeat = RepeatAll
+
+	engine.selectTrack(0, true)
+	if engine.current == nil || engine.current.index != 0 {
+		t.Fatalf("current = %+v, want track 0", engine.current)
+	}
+	if engine.queue.pending == nil || engine.queue.pending.index != 1 {
+		t.Fatalf("pending = %+v, want a prefetch of track 1", engine.queue.pending)
+	}
+
+	driveQueue(t, engine, func() bool { return engine.queue.primary != engine.current })
+	if engine.queue.primary.index != 1 {
+		t.Fatalf("promoted primary = %+v, want track 1", engine.queue.primary)
+	}
+	engine.reconcile()
+	engine.publish()
+	if engine.index != 1 || engine.current == nil || engine.current.index != 1 {
+		t.Fatalf("after reconcile: index %d current %+v", engine.index, engine.current)
+	}
+	if engine.queue.pending == nil || engine.queue.pending.index != 0 {
+		t.Fatalf("pending after promotion = %+v, want wrapped track 0", engine.queue.pending)
+	}
+	status := drainStatus(engine)
+	if status.Track.Path != second || status.NextTrack.Path != first {
+		t.Fatalf("status after promotion = track %q next %q, want second / first",
+			status.Track.Path, status.NextTrack.Path)
+	}
+}
+
+// TestEngineRepeatOnePrefetchesSameTrack confirms repeat-one is gapless: the
+// engine prefetches a fresh copy of the current track rather than the next one.
+func TestEngineRepeatOnePrefetchesSameTrack(t *testing.T) {
+	path := writeTestWAV(t, 1, 44100)
+	engine := engineWithTracks(t, []library.Track{{Path: path}})
+	t.Cleanup(engine.shutdownStreams)
+	engine.repeat = RepeatOne
+
+	engine.selectTrack(0, true)
+	if engine.queue.pending == nil || engine.queue.pending.index != 0 {
+		t.Fatalf("repeat-one pending = %+v, want a prefetch of track 0", engine.queue.pending)
+	}
+	driveQueue(t, engine, func() bool { return engine.queue.primary != engine.current })
+	engine.reconcile()
+	if engine.index != 0 || engine.current == nil || engine.current.index != 0 {
+		t.Fatalf("repeat-one current after promotion = %+v, want track 0", engine.current)
+	}
+	if engine.queue.pending == nil {
+		t.Fatal("repeat-one did not re-prefetch after promotion")
+	}
+}
+
+// TestEngineRepeatOffStopsAtEnd checks the genuine end-of-playback path: a
+// repeat-off library with no next track stops and parks on the ended track.
+func TestEngineRepeatOffStopsAtEnd(t *testing.T) {
+	path := writeTestWAV(t, 1, 44100)
+	engine := engineWithTracks(t, []library.Track{{Path: path}})
+	t.Cleanup(engine.shutdownStreams)
+	engine.repeat = RepeatOff
+
+	engine.selectTrack(0, true)
+	if engine.queue.pending != nil {
+		t.Fatalf("pending = %+v, want none for a repeat-off single track", engine.queue.pending)
+	}
+	driveQueue(t, engine, func() bool { return engine.queue.exhausted })
+	engine.reconcile()
+	if engine.playing {
+		t.Fatal("repeat-off at the end did not stop playback")
+	}
+	if engine.current == nil || engine.index != 0 {
+		t.Fatalf("deck should park on the ended track: index %d current %+v", engine.index, engine.current)
+	}
+}
+
+// TestEnginePrefetchFailureFallsBackToSkip verifies that a corrupt next track
+// does not stall the queue: no pending is installed, and at end-of-track the
+// bounded skip path advances to the next playable track.
+func TestEnginePrefetchFailureFallsBackToSkip(t *testing.T) {
+	good := writeTestWAV(t, 1, 44100)
+	corrupt := writeCorruptFile(t, "bad.mp3")
+	good2 := writeTestWAV(t, 1, 44100)
+	engine := engineWithTracks(t, []library.Track{{Path: good}, {Path: corrupt}, {Path: good2}})
+	t.Cleanup(engine.shutdownStreams)
+	engine.repeat = RepeatAll
+
+	engine.selectTrack(0, true)
+	if engine.queue.pending != nil {
+		t.Fatalf("pending = %+v, want none because the next track is corrupt", engine.queue.pending)
+	}
+	driveQueue(t, engine, func() bool { return engine.queue.exhausted })
+	engine.reconcile()
+	engine.publish()
+	if engine.current == nil || engine.current.index != 2 {
+		t.Fatalf("fallback landed on %+v, want track 2", engine.current)
+	}
+	if engine.skipped != 1 {
+		t.Fatalf("skipped = %d, want 1", engine.skipped)
+	}
+}
+
+// TestEngineSimulatedCallbackReconcileIsRaceFree runs the audio callback and the
+// engine reconcile/prefetch concurrently under -race, exercising the
+// speaker.Lock discipline that guards the queue and transports.
+func TestEngineSimulatedCallbackReconcileIsRaceFree(t *testing.T) {
+	first := writeTestWAV(t, 1, 44100)
+	second := writeTestWAV(t, 1, 44100)
+	engine := engineWithTracks(t, []library.Track{{Path: first}, {Path: second}})
+	t.Cleanup(engine.shutdownStreams)
+	engine.repeat = RepeatAll
+	engine.selectTrack(0, true)
+
+	stop := make(chan struct{})
+	var group sync.WaitGroup
+	group.Add(1)
+	go func() {
+		defer group.Done()
+		out := make([]sample, 1024)
+		for {
+			select {
+			case <-stop:
+				return
+			default:
+			}
+			speaker.Lock()
+			engine.queue.Stream(out)
+			speaker.Unlock()
+		}
+	}()
+	for i := 0; i < 10; i++ {
+		engine.reconcile()
+		engine.publish()
+	}
+	close(stop)
+	group.Wait()
+}
+
+// TestEngineCrossfadePromotesIncomingEarly checks that with a crossfade the
+// incoming track becomes current (and NEXT updates) while the outgoing is still
+// fading, and that the outgoing is retired once the fade completes.
+func TestEngineCrossfadePromotesIncomingEarly(t *testing.T) {
+	first := writeTestWAV(t, 2, 44100)
+	second := writeTestWAV(t, 2, 44100)
+	engine := engineWithTracks(t, []library.Track{{Path: first}, {Path: second}})
+	t.Cleanup(engine.shutdownStreams)
+	engine.repeat = RepeatAll
+	engine.crossfadeFrames = outputRate
+	engine.queue.crossfade = engine.crossfadeFrames
+
+	engine.selectTrack(0, true)
+	driveQueue(t, engine, func() bool { return engine.queue.fading != nil })
+	if engine.queue.primary == nil || engine.queue.primary.index != 1 {
+		t.Fatalf("incoming stream is not primary during the fade: %+v", engine.queue.primary)
+	}
+	engine.reconcile()
+	engine.publish()
+	if engine.index != 1 || engine.current == nil || engine.current.index != 1 {
+		t.Fatalf("reconcile did not adopt the incoming track: index %d current %+v", engine.index, engine.current)
+	}
+
+	driveQueue(t, engine, func() bool { return engine.queue.fading == nil })
+	engine.reconcileRetired()
+	if len(engine.queue.retired) != 0 {
+		t.Fatalf("retired streams were not drained after the fade: %v", engine.queue.retired)
+	}
+	status := drainStatus(engine)
+	if status.Track.Path != second || status.NextTrack.Path != first {
+		t.Fatalf("status during crossfade = track %q next %q, want second / first",
+			status.Track.Path, status.NextTrack.Path)
+	}
+}
+
+// TestEngineSeekCancelsCrossfade checks that a seek abandons an active fade so
+// it takes effect immediately.
+func TestEngineSeekCancelsCrossfade(t *testing.T) {
+	first := writeTestWAV(t, 2, 44100)
+	second := writeTestWAV(t, 2, 44100)
+	engine := engineWithTracks(t, []library.Track{{Path: first}, {Path: second}})
+	t.Cleanup(engine.shutdownStreams)
+	engine.repeat = RepeatAll
+	engine.crossfadeFrames = outputRate
+	engine.queue.crossfade = engine.crossfadeFrames
+	engine.selectTrack(0, true)
+
+	driveQueue(t, engine, func() bool { return engine.queue.fading != nil })
+	engine.reconcile()
+	engine.handle(Command{Action: Seek, Value: 1})
+	if engine.queue.fading != nil {
+		t.Fatal("seek did not cancel the active crossfade")
+	}
+}
+
+// TestEngineNextDuringCrossfade checks the deterministic behavior of a manual
+// skip during an active fade: both the incoming and outgoing streams are
+// abandoned and the requested track is installed immediately.
+func TestEngineNextDuringCrossfade(t *testing.T) {
+	first := writeTestWAV(t, 2, 44100)
+	second := writeTestWAV(t, 2, 44100)
+	third := writeTestWAV(t, 2, 44100)
+	engine := engineWithTracks(t, []library.Track{{Path: first}, {Path: second}, {Path: third}})
+	t.Cleanup(engine.shutdownStreams)
+	engine.repeat = RepeatAll
+	engine.crossfadeFrames = outputRate
+	engine.queue.crossfade = engine.crossfadeFrames
+	engine.selectTrack(0, true)
+
+	driveQueue(t, engine, func() bool { return engine.queue.fading != nil })
+	engine.reconcile() // adopt the incoming (track 1)
+	engine.handle(Command{Action: Next})
+
+	if engine.current == nil || engine.current.index != 2 {
+		t.Fatalf("manual next during fade landed on %+v, want track 2", engine.current)
+	}
+	if engine.queue.fading != nil {
+		t.Fatal("manual next left an outgoing stream fading")
+	}
+	// The hard change drops the old prefetch and installs a fresh one.
+	engine.reconcileRetired()
+	if len(engine.queue.retired) != 0 {
+		t.Fatalf("retired streams were not drained: %v", engine.queue.retired)
+	}
+	if engine.queue.pending == nil {
+		t.Fatal("manual next did not prefetch the following track")
+	}
+}
+
+// TestEngineStopCancelsCrossfade checks that stopping abandons an active fade
+// and parks the incoming track at its start.
+func TestEngineStopCancelsCrossfade(t *testing.T) {
+	first := writeTestWAV(t, 2, 44100)
+	second := writeTestWAV(t, 2, 44100)
+	engine := engineWithTracks(t, []library.Track{{Path: first}, {Path: second}})
+	t.Cleanup(engine.shutdownStreams)
+	engine.repeat = RepeatAll
+	engine.crossfadeFrames = outputRate
+	engine.queue.crossfade = engine.crossfadeFrames
+	engine.selectTrack(0, true)
+
+	driveQueue(t, engine, func() bool { return engine.queue.fading != nil })
+	engine.reconcile()
+	engine.handle(Command{Action: Stop})
+	if engine.queue.fading != nil {
+		t.Fatal("stop did not cancel the active crossfade")
+	}
+	if engine.playing {
+		t.Fatal("stop left playback running")
+	}
+	if engine.current == nil || engine.current.transport.PositionSeconds() != 0 {
+		t.Fatalf("stop did not rewind the incoming track: %+v", engine.current)
+	}
+}
+
+func TestCrossfadeFramesFor(t *testing.T) {
+	if got := crossfadeFramesFor(0); got != 0 {
+		t.Fatalf("crossfadeFramesFor(0) = %d, want 0", got)
+	}
+	if got := crossfadeFramesFor(1000); got != outputRate {
+		t.Fatalf("crossfadeFramesFor(1000) = %d, want %d", got, outputRate)
+	}
+	if got := crossfadeFramesFor(-5); got != 0 {
+		t.Fatalf("crossfadeFramesFor(-5) = %d, want 0", got)
+	}
+	if got := crossfadeFramesFor(999999); got != 30*outputRate {
+		t.Fatalf("crossfadeFramesFor(huge) = %d, want %d", got, 30*outputRate)
 	}
 }
 

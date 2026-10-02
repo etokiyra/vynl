@@ -727,6 +727,24 @@ func TestLibraryBoundaryAndPageNavigation(t *testing.T) {
 	}
 }
 
+func TestDeckShowsCrossfade(t *testing.T) {
+	cfg := config.Defaults()
+	cfg.Playback.CrossfadeMS = 3000
+	model := NewModel(nil, nil, cfg)
+	model.status = player.Status{Playing: true, Count: 1, Volume: 0.5}
+	panel := ansi.Strip(model.deckPanel(80, 24, model.palette()))
+	if !strings.Contains(panel, "XFADE 3.0s") {
+		t.Fatalf("deck did not show the configured crossfade:\n%s", panel)
+	}
+
+	cfg.Playback.CrossfadeMS = 0
+	model = NewModel(nil, nil, cfg)
+	panel = ansi.Strip(model.deckPanel(80, 24, model.palette()))
+	if strings.Contains(panel, "XFADE") {
+		t.Fatalf("deck showed crossfade while it was disabled:\n%s", panel)
+	}
+}
+
 func viewText(lines []string) string {
 	return strings.Join(lines, "\n")
 }

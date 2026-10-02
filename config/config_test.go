@@ -232,6 +232,34 @@ func TestEQNormalization(t *testing.T) {
 	}
 }
 
+func TestLoadPlaybackCrossfade(t *testing.T) {
+	cfg, err := Load(filepath.Join(t.TempDir(), "missing.toml"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Playback.CrossfadeMS != 0 {
+		t.Fatalf("default crossfade = %d ms, want 0", cfg.Playback.CrossfadeMS)
+	}
+
+	path := filepath.Join(t.TempDir(), "config.toml")
+	if err := os.WriteFile(path, []byte("[playback]\ncrossfade_ms = 4000\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err = Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Playback.CrossfadeMS != 4000 {
+		t.Fatalf("loaded crossfade = %d ms, want 4000", cfg.Playback.CrossfadeMS)
+	}
+	if got := (Playback{CrossfadeMS: -5}).normalized().CrossfadeMS; got != 0 {
+		t.Fatalf("negative crossfade normalized to %d, want 0", got)
+	}
+	if got := (Playback{CrossfadeMS: 999999}).normalized().CrossfadeMS; got != maxCrossfadeMS {
+		t.Fatalf("huge crossfade normalized to %d, want %d", got, maxCrossfadeMS)
+	}
+}
+
 func TestLoadReadsNewPlaybackControlBindings(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "config.toml")
 	data := "[keybindings]\nshuffle = \"j\"\nmute = \"x\"\nrestart = \"home\"\n"

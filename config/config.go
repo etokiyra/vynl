@@ -29,10 +29,12 @@ type EQ struct {
 // Playback holds optional audio adjustments. ReplayGain is a loudness
 // normalization mode: "off" (default), "track", or "album" (prefer the album
 // gain tag, falling back to the track gain). PreampDB is applied on top of the
-// chosen gain.
+// chosen gain. CrossfadeMS is the overlap between consecutive tracks (0
+// disables crossfade and keeps only the gapless join).
 type Playback struct {
-	ReplayGain string  `toml:"replaygain"`
-	PreampDB   float64 `toml:"preamp_db"`
+	ReplayGain  string  `toml:"replaygain"`
+	PreampDB    float64 `toml:"preamp_db"`
+	CrossfadeMS int     `toml:"crossfade_ms"`
 }
 
 type Theme struct {
@@ -183,8 +185,19 @@ func (p Playback) normalized() Playback {
 		p.PreampDB = 0
 	}
 	p.PreampDB = math.Max(-12, math.Min(12, p.PreampDB))
+	if p.CrossfadeMS < 0 {
+		p.CrossfadeMS = 0
+	}
+	if p.CrossfadeMS > maxCrossfadeMS {
+		p.CrossfadeMS = maxCrossfadeMS
+	}
 	return p
 }
+
+// maxCrossfadeMS bounds the crossfade so a typo cannot create an hour-long
+// overlap. It also bounds the extra memory a fade holds (the outgoing and
+// incoming rings).
+const maxCrossfadeMS = 30000
 
 // normalized replaces a non-positive (or NaN) step with its default, so a
 // misconfigured or omitted value can never make a transport key a no-op.

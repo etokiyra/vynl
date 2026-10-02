@@ -47,6 +47,10 @@ transparent terminals like kitty, foot, or Alacritty.
   can't hard-clip; a flat EQ stays exactly transparent
 - 🔀 **Shuffle, repeat & transport** — shuffle the play order, cycle repeat
   off / all / one, and mute, restart, or seek from the keyboard
+- 🔗 **Gapless playback** — consecutive tracks run on a persistent output stream,
+  so the next track starts in the same audio callback with no device restart or
+  inserted silence; an optional equal-power **crossfade** (`crossfade_ms`)
+  overlaps the end of one track with the start of the next
 - 🩹 **Resilient playback** — a corrupt or unplayable file is skipped
   automatically (bounded by the library size) and the deck shows how many were
   passed over, so one bad file never stalls a session
@@ -179,6 +183,7 @@ high_hz = 4000.0
 [playback]
 replaygain = "off"
 preamp_db  = 0.0
+crossfade_ms = 0
 
 [keybindings]
 toggle        = " "
@@ -235,6 +240,11 @@ leaves playback untouched. A file with no ReplayGain tags, or with malformed
 values, plays normally. While normalization is active the deck shows `RG TRACK`
 or `RG ALBUM` with the applied gain.
 
+`crossfade_ms` overlaps consecutive tracks by that many milliseconds (0–30000;
+0 keeps the default gapless join with no overlap). The fade uses an equal-power
+envelope, is capped so short tracks are safe, and is applied whenever the next
+track was successfully prefetched. The deck shows `XFADE <n>s` while it is on.
+
 VYNL also remembers your volume, mute, EQ, shuffle, vinyl, and repeat settings
 across runs. It writes them to a separate `state.toml` beside the config file
 (same directory), so your hand-edited `config.toml` is never rewritten. The
@@ -262,7 +272,10 @@ VYNL is built around a few core pieces:
   (`mp3`/`flac`/`wav`/`vorbis` via `beep`) behind a custom `transportStreamer`
   that applies live speed, pitch, volume, and EQ per sample and ends in a soft
   limiter. `pcm_ring.go` is the bounded, thread-safe decoded-PCM ring,
-  `order.go` owns shuffle/repeat, and `spectrum.go` is the FFT analyzer.
+  `track_stream.go` bundles one track's resources, `queue.go` is the persistent
+  streamer that upgrades a track boundary into a gapless (or crossfaded)
+  promotion, `order.go` owns shuffle/repeat, and `spectrum.go` is the FFT
+  analyzer.
 - **`library/`** — walks the configured music directory (fast, metadata only)
   and reads tags in parallel off the UI thread, streaming the track list in as
   results arrive. A rescan (`F5`) re-walks in the background and streams the new
@@ -285,6 +298,11 @@ command/status channels.
 
 ## Known limitations
 
+- Gapless transitions are always on, but only a successfully prefetched next
+  track is gapless (or crossfaded). A corrupt next track, or the end of the play
+  order with repeat off, falls back to the hard track-load path and can insert a
+  short gap. Crossfade is off by default (`crossfade_ms = 0`) and uses a fixed
+  equal-power curve
 - Decoded audio is held in a fixed ~4-second ring (about 1.35 MiB) instead of
   the whole track, so long files no longer use significant RAM. The tradeoff is
   that a distant seek waits for the decoder to reposition and refill, which
@@ -353,7 +371,9 @@ order.
 
 ### Features
 
-- [ ] Crossfade / gapless transitions between tracks
+- [x] **Gapless & crossfade** — consecutive tracks share a persistent output
+      stream (no device restart or inserted silence); an optional equal-power
+      crossfade overlaps tracks via `crossfade_ms`
 - [ ] Playlist support
 - [ ] Per-track duration in the library list
 - [ ] AUR / Homebrew packaging

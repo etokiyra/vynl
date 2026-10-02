@@ -228,11 +228,18 @@ func (s *transportStreamer) alignGrain(nominal float64) float64 {
 
 func (s *transportStreamer) interpolate(position float64) sample {
 	index := int(position) - int(s.windowBase)
-	if index < 0 || index+1 >= len(s.source) {
+	if index < 0 || index >= len(s.source) {
 		return sample{}
 	}
+	first := s.source[index]
+	// The last source frame has no next frame to interpolate toward; play it
+	// directly instead of dropping it, so a track's final sample is not a
+	// one-sample hole at a gapless boundary.
+	if index+1 >= len(s.source) {
+		return sample{float64(first[0]), float64(first[1])}
+	}
 	fraction := position - float64(int(position))
-	first, second := s.source[index], s.source[index+1]
+	second := s.source[index+1]
 	return sample{
 		float64(first[0]) + (float64(second[0])-float64(first[0]))*fraction,
 		float64(first[1]) + (float64(second[1])-float64(first[1]))*fraction,
@@ -381,6 +388,19 @@ func (s *transportStreamer) Done() bool {
 
 func (s *transportStreamer) remainingFrames() int {
 	return s.remainingFramesFor(s.totalFrames)
+}
+
+// framesRemaining reports how many output frames are left from the current
+// playback position. remainingFrames is the total output length from the
+// current base, so the frames already consumed must be subtracted; the ring's
+// declared total is preferred over the last window's total so the answer is
+// correct before the first Stream call refreshes the window.
+func (s *transportStreamer) framesRemaining() int {
+	total := s.totalFrames
+	if _, ringTotal := s.ring.status(); ringTotal > 0 {
+		total = int(ringTotal)
+	}
+	return s.remainingFramesFor(total) - s.consumed
 }
 
 // remainingFramesFor treats an unknown length (0) as unbounded so a container
