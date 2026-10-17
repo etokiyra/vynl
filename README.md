@@ -126,39 +126,40 @@ vynl -version
 | Key           | Action                          |
 | ------------- | -------------------------------- |
 | `Space`       | Play / pause                     |
-| `S`           | Stop and return to start         |
-| `N` / `P`     | Next / previous track            |
+| `s`           | Stop and return to start         |
+| `n` / `p`     | Next / previous track            |
 | `←` / `→`     | Seek back / forward 5s           |
 | `↑` / `↓`     | Volume down / up 5% *(deck focus; browses the list otherwise)* |
 | `[` / `]`     | Decrease / increase tempo 0.05   |
 | `{` / `}`     | Decrease / increase pitch 1 semitone |
-| `R`           | Reset tempo & pitch              |
-| `V`           | Toggle vinyl mode                |
+| `r`           | Reset tempo & pitch              |
+| `v`           | Toggle vinyl mode                |
 | `0`           | Restart current track from start |
-| `M`           | Mute / unmute                    |
-| `Z`           | Toggle shuffle                   |
-| `C`           | Cycle repeat: off → all → one    |
+| `m`           | Mute / unmute                    |
+| `z`           | Toggle shuffle                   |
+| `c`           | Cycle repeat: off → all → one    |
 | `1` / `2` / `3` | Select EQ band (low/mid/high; configurable) |
 | `+` / `-`     | Adjust selected EQ band gain; `=` also boosts (configurable) |
 | `Tab`         | Switch focus: library ↔ deck     |
+| `Enter`       | Play the selected track (or open/play a playlist) |
 | `/`           | Search library                   |
-| `O`           | Cycle sort: path → title → artist → album |
-| `G`           | Jump the library cursor to the playing track |
+| `o`           | Cycle sort: path → title → artist → album |
+| `g`           | Jump the library cursor to the playing track |
 | `Home` / `End` | Jump to the first / last track in the list |
 | `PgUp` / `PgDn` | Page up / down the track list       |
-| `X`           | Toggle crossfade on / off         |
+| `x`           | Toggle crossfade on / off         |
 | `<` / `>`     | Crossfade duration down / up      |
-| `J`           | Cycle ReplayGain: off → track → album |
+| `j`           | Cycle ReplayGain: off → track → album |
 | `,` / `.`     | ReplayGain preamp down / up       |
-| `L`           | Switch the browser between the library and playlists |
-| `A` / `a` / `Ctrl+A` | Add the highlighted / playing / all filtered track(s) to the open playlist |
-| `Ctrl+N` / `Ctrl+R` / `D` | New / rename / delete playlist (delete asks first) |
+| `l`           | Switch the browser between the library and playlists |
+| `a` / `A` / `Ctrl+A` | Add the playing / highlighted / all filtered track(s) to the open playlist |
+| `Ctrl+N` / `Ctrl+R` / `d` | New / rename / delete playlist (delete asks first) |
 | `Shift+↑` / `Shift+↓` | Reorder the selected playlist entry |
-| `Esc`         | Close the open playlist / leave the playlist browser |
+| `Esc`         | Cancel search / close the open playlist / leave the playlist browser |
 | `F5`          | Rescan the music folder                   |
 | `?`           | Show the full keybinding help    |
 | `Ctrl+C`      | Quit (always, even while searching) |
-| `Q`           | Quit                              |
+| `q`           | Quit                              |
 
 > `↑` / `↓` change volume while the deck has focus and browse the library (or
 > the playlist browser) while it has focus; `←` / `→` always seek. While the
@@ -304,7 +305,7 @@ Crossfade, ReplayGain mode, and the ReplayGain preamp can be changed while VYNL
 runs. These are **session settings**: the config file supplies the values loaded
 at startup, and `state.toml` (volume, mute, EQ, shuffle, vinyl, repeat) is
 unchanged. Crossfade defaults to `crossfade_ms` and can be toggled/adjusted with
-`X` and `<`/`>`; ReplayGain cycles with `J` and the preamp moves with `,`/`.`.
+`x` and `<`/`>`; ReplayGain cycles with `j` and the preamp moves with `,`/`.`.
 Tempo, pitch, volume, and the EQ bands were already live. Changing a setting
 applies to the current track, the prefetched next track, and any in-progress
 crossfade without restarting playback.
@@ -328,10 +329,10 @@ are stripped of path separators, and entries that no longer resolve are kept and
 shown as unavailable (opening one lets the normal auto-skip move to the next
 playable track). Spaces and non-ASCII names are handled as written.
 
-Press `L` to open the playlist browser, `Ctrl+N` to create a playlist, and
-`Enter` to open or play. `A`/`a`/`Ctrl+A` add the highlighted library track, the
-playing track, or the whole filtered library. `Shift+↑`/`Shift+↓` reorder
-entries, `D` removes an entry (or deletes a playlist, after a confirmation), and
+Press `l` to open the playlist browser, `Ctrl+N` to create a playlist, and
+`Enter` to open or play. `a`/`A`/`Ctrl+A` add the playing track, the highlighted
+library track, or the whole filtered library. `Shift+↑`/`Shift+↓` reorder
+entries, `d` removes an entry (or deletes a playlist, after a confirmation), and
 `Esc` goes back. Playing a playlist hands its tracks to the same engine the
 library uses, so Next/Prev, repeat, shuffle, auto-skip, gapless joins, and
 crossfade all follow the playlist order. Editing a playlist writes the file
