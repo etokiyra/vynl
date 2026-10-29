@@ -1894,7 +1894,10 @@ func fuzzyScore(query, candidate string) (int, bool) {
 
 func (m Model) playbackPosition() float64 {
 	position := m.status.Position
-	if m.status.Playing && !m.status.Buffering && !m.statusAt.IsZero() {
+	if m.status.Playing && !m.status.Buffering && !m.status.Loading && !m.statusAt.IsZero() {
+		// Loading publishes Position/Duration as zero (nothing is decoded yet),
+		// so extrapolating across a hard track switch would tick the bar up from
+		// 0 under the LOADING label and then snap back.
 		position += max(0, time.Since(m.statusAt).Seconds()) * max(0, m.status.Speed)
 	}
 	return math.Min(m.status.Duration, math.Max(0, position))
