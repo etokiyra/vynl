@@ -29,6 +29,7 @@ type transportStreamer struct {
 	totalFrames   int
 	sourceDone    bool
 	buffering     bool
+	seekPastEnd   bool // finished ring with the window beyond its extent
 	rate          float64
 	speed         float64
 	pitch         float64
@@ -266,6 +267,7 @@ func (s *transportStreamer) refreshSource(outLen int) {
 	view := s.ring.window(lo, lo+span, scratch)
 	s.totalFrames = int(view.total)
 	s.sourceDone = view.finished
+	s.seekPastEnd = !view.ready && view.pastEnd
 	if !view.ready {
 		s.source = nil
 		s.windowBase = lo
@@ -279,8 +281,14 @@ func (s *transportStreamer) refreshSource(outLen int) {
 
 // needsMoreData distinguishes "wait for the producer" from the real end of the
 // track. A blocked ring (seek rewrite in flight, or evicted data) takes the
-// same buffering path as a producer that has not decoded far enough yet.
+// same buffering path as a producer that has not decoded far enough yet —
+// unless the window is unservable (past the finished ring's extent), which is
+// a genuine end of the audio (a seek clamped past a short-decoded file, or a
+// container that over-declared its length), not data we could still produce.
 func (s *transportStreamer) needsMoreData() bool {
+	if s.ringBlocked && s.seekPastEnd {
+		return false
+	}
 	return s.ringBlocked || !s.sourceDone
 }
 

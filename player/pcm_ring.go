@@ -43,12 +43,15 @@ type pcmRing struct {
 
 // ringView is the consumer's view of a contiguous source window. When ready is
 // false the transport must take its existing buffering/underflow path.
+// pastEnd marks windows that can never be served: the producer has finished
+// (EOF or error) and the requested start lies beyond the final extent.
 type ringView struct {
 	samples  []pcmSample
 	base     int64
 	total    int64
 	finished bool
 	ready    bool
+	pastEnd  bool
 }
 
 const (
@@ -257,6 +260,25 @@ func (r *pcmRing) commitSeek(gen uint64, frame int64) {
 	r.notify()
 }
 
+// commitAfterDecode acks a seek whose target was reached by decoding ahead
+// instead of repositioning the decoder. The ring window stays continuous (no
+// reset), the already-decoded frames are still valid, and a newer seek leaves
+// this ack unpublished so the consumer keeps waiting.
+func (r *pcmRing) commitAfterDecode(gen uint64) {
+	r.mu.Lock()
+	if r.seekGen == gen {
+		r.seekAcked = gen
+	}
+	r.mu.Unlock()
+	r.notify()
+}
+
+// frameEndLocked is the decoded extent (absolute frame coordinate). Caller
+// holds r.mu.
+func (r *pcmRing) frameEndLocked() int64 {
+	return r.base + int64(r.length)
+}
+
 // finish marks the ring complete and pins total to the decoded extent (which
 // also makes unknown-length containers playable end to end).
 func (r *pcmRing) finish(err error) {
@@ -343,7 +365,13 @@ func (r *pcmRing) window(lo, hi int64, dst []pcmSample) ringView {
 
 	end := r.base + int64(r.length)
 	if lo < r.base || lo >= end {
-		return ringView{total: r.total, finished: r.finished}
+		return ringView{
+			total: r.total, finished: r.finished,
+			// pastEnd only counts a finished ring: an empty ring here is a
+			// freshly seeked (or still-empty) window that the producer can
+			// still fill.
+			pastEnd: r.finished && lo >= end,
+		}
 	}
 	if hi > end {
 		hi = end

@@ -614,8 +614,10 @@ func (e *Engine) park(index int, reason error) {
 	speaker.Unlock()
 }
 
-// reconcileRetired closes the streams the audio callback finished with. Closing
-// joins a decoder, so it runs on the engine goroutine.
+// reconcileRetired closes the streams the audio callback finished with. close
+// joins a producer, which is bounded here (then handed to a janitor goroutine)
+// so a decoder stuck inside a slow call can never freeze the engine goroutine
+// or its command handling.
 func (e *Engine) reconcileRetired() {
 	if e.queue == nil {
 		return
@@ -624,9 +626,13 @@ func (e *Engine) reconcileRetired() {
 	retired := e.queue.drainRetired()
 	speaker.Unlock()
 	for _, stream := range retired {
-		stream.close()
+		stream.closeWithTimeout(slowCloseTimeout)
 	}
 }
+
+// slowCloseTimeout bounds how long a retired stream's producer join may block
+// track switching before the join moves to a janitor goroutine.
+const slowCloseTimeout = 250 * time.Millisecond
 
 // cancelFade abandons an in-progress crossfade so a seek, restart, or stop takes
 // effect immediately, and closes the retired outgoing stream.

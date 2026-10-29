@@ -58,9 +58,11 @@ consecutive tracks for gapless joins) → `beep.Ctrl` → output.
    is done with (promoted primary, completed fade) is appended to `retired`;
    only `reconcileRetired` on the engine goroutine calls `stream.close()`,
    which joins the producer. Closing inside `Stream` would stall output.
-3. **The engine goroutine owns teardown.** `close()` is not re-entrant-safe (it
-   nils `cancel`/`done` after joining); it runs only from
-   `reconcileRetired`/`stopCurrent` call sites on that goroutine.
+3. **The engine goroutine owns teardown.** `close()` is not re-entrant-safe; it
+   runs only from the engine goroutine, and engine teardown goes through
+   `reconcileRetired` with a bounded join (`closeWithTimeout(slowCloseTimeout)`):
+   a decoder stuck inside a slow call (seek-table rebuild, slow file) hands
+   the join to a janitor goroutine so commands and switching never stall.
 4. **Tag/file I/O never happens under `speaker.Lock`**
    (`applyReplayGain`, `configureStream`, `buildStream` pattern: choose
    streams under the lock, do the I/O without it, re-apply under the lock).
@@ -86,14 +88,28 @@ consecutive tracks for gapless joins) → `beep.Ctrl` → output.
   forward seek beyond the resident window cannot be served from the ring: it
   breaks into decoder reposition + refill buffering. `ensure()` decides this;
   `TestRingStaysResidentAcrossADefaultForwardSkip` guards it.
+- **Forward repositions use decode-ahead, not `decoder.Seek`**
+  (`trackStream.repositionSeek`): the sequential decoder keeps running under
+  normal flow control until the ring covers the target, then `commitAfterDecode`
+  acks with the window intact. Decoder repositioning is not uniformly cheap —
+  a FLAC without a seek table decodes the whole file inside its `Seek` just to
+  index frames (per seek, per fresh decoder) — so the producer decodes ahead
+  for hops the ring can hold (`maxRepositionDiscard`, ~60 s), and falls back
+  to the real reposition for backward or out-of-capacity targets.
+  `TestForwardSeekRepositionsViaDecodeAhead` and
+  `TestCommitAfterDecodeAckKeepsWindow` pin this.
 - `freeSpaceLocked` is monotonic in `readHead`: a backward readHead move can
   never let the producer overwrite frames the consumer still needs.
-- A seek requested by the consumer is answered by `commitSeek` with the same
-  generation; a newer `seekGen` means a stale commit is discarded and the
-  consumer keeps waiting. The producer re-reads `pendingSeek` on every loop
-  iteration, so progress never depends on receiving a wake.
+- A seek requested by the consumer is answered by `commitSeek` or
+  `commitAfterDecode` with the same generation; a newer `seekGen` means a
+  stale commit is discarded and the consumer keeps waiting. The producer
+  re-reads `pendingSeek` on every loop iteration, so progress never depends on
+  receiving a wake.
 - After EOF the producer stays alive (draining wakes) so backward/restart
-  seeks can re-enter decoding.
+  seeks can re-enter decoding. `ringView.pastEnd` (finished ring, window
+  beyond its extent) tells the transport a buffering wait is really track end;
+  an *empty* ring is not past end — it is a fresh/seeked window the producer
+  can still fill.
 
 ### Gapless/crossfade rules
 

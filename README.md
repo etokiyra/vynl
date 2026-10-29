@@ -388,10 +388,12 @@ command/status channels.
   short gap. Crossfade is off by default (`crossfade_ms = 0`) and uses a fixed
   equal-power curve
 - Decoded audio is held in a fixed ~12-second ring (about 4.2 MiB) instead of
-  the whole track, so long files no longer use significant RAM. The tradeoff is
-  that a distant seek waits for the decoder to reposition and refill, which
-  shows as brief buffering; seeks inside the resident window (about 1 s back /
-  11 s forward, comfortably more than the default 5 s skip) are instant
+  the whole track, so long files no longer use significant RAM. Small skips
+  and forward seeks are served from resident audio or by decoding ahead, so
+  they land in the jump distance's decode time rather than a decoder-bound
+  reposition (FLAC files without a seek table decode the whole file inside
+  their seek, which VYNL avoids by decoding ahead). Large backward jumps
+  still reposition the decoder and can show brief buffering
 - The 3-band EQ uses fixed-slope Linkwitz-Riley crossovers (the crossover
   frequencies are configurable via `[eq] low_hz`/`high_hz`, but the slope is
   fixed); it is not a parametric EQ
