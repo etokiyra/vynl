@@ -83,6 +83,10 @@ func (q *queueStreamer) streamGapless(out [][2]float64) (int, bool) {
 		q.retire(q.primary)
 		q.primary = q.pending
 		q.pending = nil
+		// An earlier exhausted (a track end with no pending yet) must not
+		// outlive a resumed promotion: reconcile reads the flag after adopting
+		// the new primary and would otherwise hard-advance again.
+		q.exhausted = false
 	}
 	return written, true
 }

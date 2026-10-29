@@ -133,6 +133,40 @@ func TestQueueStreamerExhaustsWithoutPending(t *testing.T) {
 	}
 }
 
+// TestQueueStreamerPromotionClearsStaleExhausted covers the interplay at a
+// boundary whose prefetch arrives late: the callback exhausts the primary, the
+// engine then installs a pending, and the next Stream call promotes it. The
+// stale exhausted flag must be cleared by that promotion, or reconcile would
+// consume it afterwards and hard-advance past a track that is playing.
+func TestQueueStreamerPromotionClearsStaleExhausted(t *testing.T) {
+	queue := newQueueStreamer()
+	first := staticTrackStream(0, constantPCM(0.5, 400))
+	second := staticTrackStream(1, constantPCM(0.25, 400))
+	queue.setPrimary(first)
+	collectFrames(t, queue, 128, 400)
+	if !queue.exhausted {
+		t.Fatal("setup: first track did not exhaust")
+	}
+
+	queue.setPending(second)
+	out := make([]sample, 128)
+	n, ok := queue.Stream(out)
+	if !ok || n != len(out) {
+		t.Fatalf("promotion Stream = (%d, %t), want (%d, true)", n, ok, len(out))
+	}
+	if queue.exhausted {
+		t.Fatal("stale exhausted flag survived the gapless promotion")
+	}
+	if queue.primary != second {
+		t.Fatal("pending was not promoted after a late prefetch")
+	}
+	for i, frame := range out {
+		if math.Abs(frame[0]-0.25) > 1e-6 {
+			t.Fatalf("promoted frame %d = %v, want 0.25", i, frame)
+		}
+	}
+}
+
 func TestQueueStreamerClearRetiresEverything(t *testing.T) {
 	queue := newQueueStreamer()
 	primary := staticTrackStream(0, constantPCM(0.1, 10))

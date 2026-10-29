@@ -954,7 +954,18 @@ func (e *Engine) applyEQ(band int) {
 // ended with no prefetched next (every candidate failed to open, or repeat-off
 // reached the end of the order). It uses the bounded skip path, so a corrupt
 // next track is skipped rather than stalling, at the cost of a short gap.
+//
+// A pending stream may have arrived after the audio callback checked for one
+// (it sets exhausted while a prefetch is still being built). If one exists now,
+// the next callback promotes it gaplessly, so hard-loading here would discard
+// already-decoded audio and break the otherwise-gapless join.
 func (e *Engine) advanceTrack() {
+	speaker.Lock()
+	pending := e.queue.pending
+	speaker.Unlock()
+	if pending != nil {
+		return
+	}
 	next, stop := repeatAdvance(&e.order, e.index, e.repeat, e.shuffle)
 	if stop {
 		e.playing = false

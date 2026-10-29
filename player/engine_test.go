@@ -673,6 +673,59 @@ func driveQueue(t *testing.T, engine *Engine, cond func() bool) {
 	}
 }
 
+// TestEngineAdvanceTrackDoesNotDiscardArrivedPrefetch regression-tests the
+// switch-boundary race: the audio callback sets exhausted at primary end while
+// a prefetch is still being built; if the prefetch lands before the engine
+// reconciles, the next callback would promote it gaplessly. advanceTrack must
+// therefore step aside instead of hard-loading and discarding that decoded
+// audio (which broke into buffering on song switches).
+func TestEngineAdvanceTrackDoesNotDiscardArrivedPrefetch(t *testing.T) {
+	first := writeTestWAV(t, 1, 44100)
+	second := writeTestWAV(t, 1, 44100)
+	engine := engineWithTracks(t, []library.Track{{Path: first}, {Path: second}})
+	t.Cleanup(engine.shutdownStreams)
+	engine.repeat = RepeatAll
+
+	engine.selectTrack(0, true)
+	if engine.current == nil || engine.current.index != 0 {
+		t.Fatalf("current = %+v, want track 0", engine.current)
+	}
+	// Drop the automatic prefetch so the boundary exhausts like a slow prefetch
+	// (nothing installed at the moment the track ends).
+	engine.dropPending()
+	driveQueue(t, engine, func() bool { return engine.queue.exhausted })
+
+	// The prefetch finishes building after the callback already gave up.
+	pending, err := engine.buildStream(1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	engine.queue.setPending(pending)
+
+	engine.advanceTrack()
+	if engine.current == nil || engine.current.index != 0 {
+		t.Fatalf("advanceTrack discarded the arrived prefetch: current %+v", engine.current)
+	}
+	if engine.queue.pending != pending {
+		t.Fatal("arrived pending stream was not kept for the gapless promotion")
+	}
+	if !engine.queue.exhausted {
+		t.Fatal("setup: exhausted flag was consumed by the guard")
+	}
+
+	// The next callback promotes the pending; reconcile adopts it.
+	driveQueue(t, engine, func() bool { return engine.queue.primary == pending })
+	engine.reconcile()
+	engine.publish()
+	if engine.index != 1 || engine.current == nil || engine.current.index != 1 {
+		t.Fatalf("after adopting the late prefetch: index %d current %+v", engine.index, engine.current)
+	}
+	status := drainStatus(engine)
+	if status.Track.Path != second {
+		t.Fatalf("status track = %q, want %q", status.Track.Path, second)
+	}
+}
+
 // TestEngineGaplessPromotionAdvancesState checks the engine side of a gapless
 // boundary: when the queue promotes the prefetched track, reconcile adopts it,
 // updates the index and NEXT, and prefetches onward.
