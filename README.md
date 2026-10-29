@@ -387,10 +387,11 @@ command/status channels.
   order with repeat off, falls back to the hard track-load path and can insert a
   short gap. Crossfade is off by default (`crossfade_ms = 0`) and uses a fixed
   equal-power curve
-- Decoded audio is held in a fixed ~4-second ring (about 1.35 MiB) instead of
+- Decoded audio is held in a fixed ~12-second ring (about 4.2 MiB) instead of
   the whole track, so long files no longer use significant RAM. The tradeoff is
   that a distant seek waits for the decoder to reposition and refill, which
-  shows as brief buffering; seeks inside the resident window are instant
+  shows as brief buffering; seeks inside the resident window (about 1 s back /
+  11 s forward, comfortably more than the default 5 s skip) are instant
 - The 3-band EQ uses fixed-slope Linkwitz-Riley crossovers (the crossover
   frequencies are configurable via `[eq] low_hz`/`high_hz`, but the slope is
   fixed); it is not a parametric EQ
@@ -431,8 +432,8 @@ order.
 
 ### Near term
 
-- [x] **Bound the PCM memory** — decoded audio now lives in a fixed 4-second
-      ring (~1.35 MiB); the decoder is a flow-controlled producer that re-seeks
+- [x] **Bound the PCM memory** — decoded audio now lives in a fixed 12-second
+      ring (~4.2 MiB); the decoder is a flow-controlled producer that re-seeks
       on out-of-window jumps, so multi-hour files no longer use gigabytes of RAM
 - [x] **Persist playback state** — volume, mute, EQ, shuffle, vinyl, and repeat
       are saved to a separate `state.toml` and restored across runs

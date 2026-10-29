@@ -74,8 +74,15 @@ const (
 	// they must not shrink it to or below ringMargin.
 	ringLookbackFrames = outputRate // 1.0 s
 	// ringCapacityFrames trades RAM for seek responsiveness and decoder slack:
-	// 4.0 s at 44100 Hz is ~1.35 MiB at 8 bytes/frame, constant for any file.
-	ringCapacityFrames = 4 * outputRate
+	// 12 s at 44100 Hz is ~4.2 MiB at 8 bytes/frame, constant for any file.
+	// The forward-resident window is capacity-lookback (~11 s here), which
+	// must stay comfortably larger than the default skip step ([steps] seek =
+	// 5.0 s): a forward skip beyond the resident window cannot be served from
+	// the ring and breaks into decoder-refill buffering instead. With ~11 s of
+	// resident look-ahead, two consecutive default skips are still instant.
+	// Whatever changes here must keep look-ahead > the default seek step plus
+	// the transport's ringAheadWindow, or small skips regress to the slow path.
+	ringCapacityFrames = 12 * outputRate
 )
 
 func newPCMRing(capacity int) *pcmRing {

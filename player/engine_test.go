@@ -92,7 +92,7 @@ func waitForRing(t *testing.T, ring *pcmRing) {
 // That must trigger a real decoder re-seek and route through the buffering path
 // until the producer acks, after which playback resumes.
 func TestStreamSeeksAndResumesThroughRing(t *testing.T) {
-	const seconds = 6 // 264,600 frames, larger than the 176,400-frame ring
+	const seconds = 20 // 882,000 frames, larger than the 529,200-frame ring
 	path := writeTestWAV(t, seconds, 44100)
 	stream, err := openTrackStream(0, path)
 	if err != nil {
