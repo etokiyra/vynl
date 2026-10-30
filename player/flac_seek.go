@@ -22,6 +22,7 @@ package player
 import (
 	"bytes"
 	"io"
+	"log"
 	"os"
 	"sort"
 	"sync"
@@ -351,6 +352,43 @@ func flacKeyFor(path string) (flacIndexKey, bool) {
 	}, true
 }
 
+// flacLogState refcounts the standard library logger swap used below:
+// mewkiz's frame parser logs "not yet implemented"-style warnings through
+// log.Printf for header field values it does not recognize - which fires for
+// thousands of raw-byte candidates during the index scan (and occasionally
+// for decoder frames) - straight at STDERR. In a TUI that paints garbage into
+// the running interface, so every call into the parser is silenced.
+type flacLogState struct {
+	mu    sync.Mutex
+	depth int
+	prev  io.Writer
+}
+
+var flacLog flacLogState
+
+// flacQuiet runs fn with the process logger silenced. The swap is
+// refcounted rather than guarded: concurrent silent sections (the background
+// index build and producer decode both reach the parser) keep the logger
+// discarded until the last one exits, so an audio-path section never stalls
+// on the index build.
+func flacQuiet(fn func()) {
+	flacLog.mu.Lock()
+	flacLog.depth++
+	if flacLog.depth == 1 {
+		flacLog.prev = log.Writer()
+		log.SetOutput(io.Discard)
+	}
+	flacLog.mu.Unlock()
+	fn()
+	flacLog.mu.Lock()
+	flacLog.depth--
+	if flacLog.depth == 0 {
+		log.SetOutput(flacLog.prev)
+		flacLog.prev = nil
+	}
+	flacLog.mu.Unlock()
+}
+
 // flacIndexLoader builds the index in the background the moment a decoder is
 // constructed, and publishes it via an atomic pointer when done. The staged
 // build publishes the stored seek table first when the file has one (coarse
@@ -382,7 +420,15 @@ func newFlacIndexLoader(path string) *flacIndexLoader {
 // buildFlacIndexStaged populates the loader: the stored seek table first when
 // it is sane (coarse but immediate), then the frame-exact scan replaces it.
 // It returns whether any index ended up published.
-func buildFlacIndexStaged(path string, loader *flacIndexLoader) (bool, error) {
+func buildFlacIndexStaged(path string, loader *flacIndexLoader) (published bool, err error) {
+	// The scan parses thousands of raw-byte header candidates; mewkiz logs on
+	// unrecognized field values, which must never reach the terminal. The
+	// named returns make the deferred silence wrapper tidy.
+	flacQuiet(func() { published, err = buildFlacIndexStagedLocked(path, loader) })
+	return published, err
+}
+
+func buildFlacIndexStagedLocked(path string, loader *flacIndexLoader) (bool, error) {
 	f, err := os.Open(path)
 	if err != nil {
 		return false, err

@@ -127,7 +127,11 @@ func (s *flacDecoder) convert(frame *frame.Frame) {
 // It reports io.EOF at the graceful end of the stream (as frame.New does) and
 // adopts a sticky error on decoder failures.
 func (s *flacDecoder) refill() error {
-	frame, err := frame.Parse(s.file)
+	var parsed *frame.Frame
+	var err error
+	// Silenced like the scan: even a real decode can hit a mewkiz log line
+	// (unrecognized header/subframe field values would paint into the TUI).
+	flacQuiet(func() { parsed, err = frame.Parse(s.file) })
 	if err == io.EOF || err == io.ErrUnexpectedEOF {
 		s.eof = true
 		return io.EOF
@@ -137,9 +141,9 @@ func (s *flacDecoder) refill() error {
 		s.eof = true
 		return err
 	}
-	s.convert(frame)
+	s.convert(parsed)
 	s.bufPos = 0
-	s.base = flacFrameSample(frame)
+	s.base = flacFrameSample(parsed)
 	return nil
 }
 

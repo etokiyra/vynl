@@ -7,7 +7,10 @@ package player
 // environment and skip elsewhere; the WAV-based rolling test runs always.
 
 import (
+	"bytes"
+	"log"
 	"os"
+	"strings"
 	"testing"
 	"time"
 )
@@ -301,4 +304,30 @@ func TestLongFileEndJumpIsFast(t *testing.T) {
 	}
 }
 
-// basenameOf reserved for test logging.
+// TestFlacQuietSilencesParserLogs pins the UI rule: mewkiz's frame parser
+// logs "not yet implemented" warnings for unrecognized header field values,
+// which would paint straight into the terminal while the TUI runs. Anything
+// wrapped in flacQuiet must stay silent, and the logger must be restored
+// afterwards.
+func TestFlacQuietSilencesParserLogs(t *testing.T) {
+	before := log.Writer()
+	flacQuiet(func() {
+		log.Printf("frame.Frame.parseHeader: The flac library test cases do not yet include any audio files with %d bits-per-sample.", 23)
+	})
+	if got := log.Writer(); got != before {
+		t.Fatal("stale logger after flacQuiet: output was not restored")
+	}
+	sink := &bytes.Buffer{}
+	log.SetOutput(sink)
+	defer log.SetOutput(before)
+	flacQuiet(func() {
+		log.Printf("should be swallowed")
+	})
+	if sink.Len() != 0 {
+		t.Fatalf("flacQuiet leaked %d bytes into the logger: %q", sink.Len(), sink.String())
+	}
+	log.Print("visible") // sanity: outside the wrapper output still flows
+	if !strings.Contains(sink.String(), "visible") {
+		t.Fatal("logger swallowed output outside flacQuiet")
+	}
+}
