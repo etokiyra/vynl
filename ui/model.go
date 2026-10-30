@@ -2152,7 +2152,13 @@ func vuInline(rms [2]float64, playing bool, p palette) string {
 		for channel := range glyphs {
 			level := min(7, int(math.Round(math.Min(1, rms[channel]*2)*7)))
 			if level > 0 {
-				glyphs[channel] = p.pink.Render(string(blocks[level]))
+				color := p.green
+				if level >= 5 {
+					color = p.pink
+				} else if level >= 3 {
+					color = p.magenta
+				}
+				glyphs[channel] = color.Render(string(blocks[level]))
 			}
 		}
 	}
