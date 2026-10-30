@@ -2063,7 +2063,7 @@ func vinylArt(width int, phase float64, p palette, accents ...lipgloss.Style) []
 			}
 		}
 		var rendered strings.Builder
-		for _, glyph := range line {
+		for col, glyph := range []rune(line) {
 			style := p.cyan
 			switch glyph {
 			case ':':
@@ -2076,6 +2076,24 @@ func vinylArt(width int, phase float64, p palette, accents ...lipgloss.Style) []
 				style = p.pink
 			case '+':
 				style = outerAccent
+			}
+			// Soft rotating highlight: cells whose angle is close to the
+			// marker's angle brighten, reading as a light sheen sweeping
+			// around the disc rather than a hard spoke.
+			if glyph != ' ' {
+				dx := float64(col) - cx
+				dy := (float64(row) - cy) * 2
+				angle := math.Atan2(dy, dx)
+				if angle < 0 {
+					angle += 2 * math.Pi
+				}
+				diff := math.Abs(angle - markerAngle)
+				if diff > math.Pi {
+					diff = 2*math.Pi - diff
+				}
+				if diff < 0.4 {
+					style = p.text.Bold(true)
+				}
 			}
 			rendered.WriteString(style.Render(string(glyph)))
 		}
