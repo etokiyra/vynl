@@ -238,24 +238,24 @@ func (m Model) Update(message tea.Msg) (tea.Model, tea.Cmd) {
 	case tickMsg:
 		if m.status.Playing {
 			m.frame++
-			m.wheelPhase += maxFloat(0.25, m.status.Speed)
+			m.wheelPhase += maxFloat(0.083, m.status.Speed*0.33)
 		}
-		m.rmsLevel += (m.rmsTarget - m.rmsLevel) * 0.32
+		m.rmsLevel += (m.rmsTarget - m.rmsLevel) * 0.12
 		for channel := range m.channelLevel {
-			m.channelLevel[channel] += (m.channelTarget[channel] - m.channelLevel[channel]) * 0.32
+			m.channelLevel[channel] += (m.channelTarget[channel] - m.channelLevel[channel]) * 0.12
 		}
-		m.bassLevel += (m.bassTarget - m.bassLevel) * 0.32
+		m.bassLevel += (m.bassTarget - m.bassLevel) * 0.12
 		for band := range m.spectrum {
-			rate := 0.45
+			rate := 0.18
 			if m.spectrumTarget[band] < m.spectrum[band] {
-				rate = 0.18 // decay more slowly than the rise for a natural falloff
+				rate = 0.07 // decay more slowly than the rise for a natural falloff
 			}
 			m.spectrum[band] += (m.spectrumTarget[band] - m.spectrum[band]) * rate
 			switch {
 			case m.spectrum[band] >= m.spectrumHold[band]:
 				m.spectrumHold[band] = m.spectrum[band]
 			case m.spectrumHold[band] > 0:
-				m.spectrumHold[band] = math.Max(m.spectrum[band], m.spectrumHold[band]-0.015)
+				m.spectrumHold[band] = math.Max(m.spectrum[band], m.spectrumHold[band]-0.005)
 			}
 		}
 		if m.status.Playing || m.hasPendingEase() {
@@ -1287,7 +1287,7 @@ func (m Model) View() string {
 	live := "·"
 	if m.status.Playing {
 		liveFrames := []string{"·", "•", "*", "•"}
-		live = liveFrames[(m.frame/2)%len(liveFrames)]
+		live = liveFrames[(m.frame/6)%len(liveFrames)]
 	}
 	header := palette.cyan.Bold(true).Render("VYNL") + palette.muted.Render("  /  ANALOG AUDIO CONSOLE") + palette.green.Render("  "+live+" LIVE")
 	header = fixedBlock(header, innerWidth, headerHeight, palette.background)
@@ -1528,7 +1528,7 @@ func (m Model) deckPanel(width, height int, p palette) string {
 	marker := p.muted.Render("[ PAUSED ]")
 	if m.status.Playing {
 		icons := []string{">>>", "> >", ">>>", " > "}
-		marker = p.green.Bold(true).Render("[ " + icons[(m.frame/2)%len(icons)] + " PLAYING ]")
+		marker = p.green.Bold(true).Render("[ " + icons[(m.frame/6)%len(icons)] + " PLAYING ]")
 	}
 	modes := []string{"VINYL " + boolLabel(m.status.Vinyl)}
 	if m.status.Shuffle {
@@ -1657,9 +1657,18 @@ func stereoMeterLines(height int, rms [2]float64, playing bool, p palette) []str
 		glyphs := [2]string{"  ", "  "}
 		for channel := range glyphs {
 			if height-row <= active[channel] {
-				glyphs[channel] = p.pink.Render("█")
+				color := p.green
+				switch {
+				case row <= height/4:
+					color = p.pink
+				case row <= height/2:
+					color = p.magenta
+				}
+				glyphs[channel] = color.Render("█")
 			}
 		}
+		// Color the meter cells by height so the peaks read as a gradient
+		// (green body, magenta mid, pink/red top) instead of a flat block.
 		lines[row] = "  " + glyphs[0] + "      " + glyphs[1]
 	}
 	return lines
@@ -2056,8 +2065,17 @@ func vinylArt(width int, phase float64, p palette, accents ...lipgloss.Style) []
 		var rendered strings.Builder
 		for _, glyph := range line {
 			style := p.cyan
-			if glyph == '#' {
+			switch glyph {
+			case '#':
 				style = outerAccent
+			case 'O':
+				style = p.cyan
+			case '*':
+				style = p.magenta
+			case '+':
+				style = p.pink
+			case '=':
+				style = p.green
 			}
 			rendered.WriteString(style.Render(string(glyph)))
 		}
@@ -2293,7 +2311,7 @@ func progressBar(position, duration float64, width, frame int, playing bool) str
 	for i := 0; i < width; i++ {
 		switch {
 		case i == filled:
-			if playing && frame%4 < 2 {
+			if playing && frame%12 < 6 {
 				bar.WriteRune('◇')
 			} else {
 				bar.WriteRune('◆')
@@ -2424,7 +2442,7 @@ type palette struct {
 }
 
 func tick() tea.Cmd {
-	return tea.Tick(100*time.Millisecond, func(now time.Time) tea.Msg { return tickMsg(now) })
+	return tea.Tick(33*time.Millisecond, func(now time.Time) tea.Msg { return tickMsg(now) })
 }
 
 func waitForStatus(updates <-chan player.Status) tea.Cmd {
