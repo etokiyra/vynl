@@ -1498,7 +1498,7 @@ func (m Model) deckPanel(width, height int, p palette) string {
 	)
 	top := info
 	if showVinyl {
-		art := vinylArt(vinylWidth, m.wheelPhase, p, m.pulseStyle())
+		art := spectrumRing(vinylWidth, m.spectrum, m.spectrumHold, m.wheelPhase, p)
 		for len(info) < len(art) {
 			info = append(info, "")
 		}
@@ -2098,6 +2098,110 @@ func vinylArt(width int, phase float64, p palette, accents ...lipgloss.Style) []
 			rendered.WriteString(style.Render(string(glyph)))
 		}
 		rows[row] = rendered.String()
+	}
+	return rows
+}
+
+func spectrumRing(width int, spectrum, hold [player.SpectrumBands]float64, phase float64, p palette) []string {
+	templateWidth := max(21, min(41, width))
+	if templateWidth%2 == 0 {
+		templateWidth--
+	}
+	templateHeight := templateWidth / 2
+	if templateHeight%2 == 0 {
+		templateHeight++
+	}
+	canvas := make([][]rune, templateHeight)
+	colors := make([][]lipgloss.Style, templateHeight)
+	for row := range canvas {
+		canvas[row] = []rune(strings.Repeat(" ", templateWidth))
+		colors[row] = make([]lipgloss.Style, templateWidth)
+		for col := range colors[row] {
+			colors[row][col] = p.muted
+		}
+	}
+	cx, cy := float64((templateWidth-1)/2), float64((templateHeight-1)/2)
+	aspect := 2.0
+	maxRadius := math.Min(cx, cy*aspect)
+	innerRadius := maxRadius * 0.50
+	bars := 48
+	for row := 0; row < templateHeight; row++ {
+		for col := 0; col < templateWidth; col++ {
+			dx := float64(col) - cx
+			dy := (float64(row) - cy) * aspect
+			r := math.Sqrt(dx*dx + dy*dy)
+			if r < innerRadius-0.5 || r > maxRadius+0.5 {
+				continue
+			}
+			angle := math.Atan2(dy, dx)
+			if angle < 0 {
+				angle += 2 * math.Pi
+			}
+			bandAngle := angle + phase*0.15
+			if bandAngle >= 2*math.Pi {
+				bandAngle -= 2 * math.Pi
+			}
+			barIndex := int(bandAngle / (2 * math.Pi) * float64(bars))
+			if barIndex >= bars {
+				barIndex = bars - 1
+			}
+			band := barIndex * (player.SpectrumBands / bars)
+			if band >= player.SpectrumBands {
+				band = player.SpectrumBands - 1
+			}
+			level := spectrum[band]
+			peak := hold[band]
+			outer := innerRadius + level*(maxRadius-innerRadius)*0.85
+			if r <= outer {
+				// shade by depth into the ring
+				depth := (outer - r) / (outer - innerRadius + 0.01)
+				glyph := '░'
+				if depth > 0.66 {
+					glyph = '█'
+				} else if depth > 0.33 {
+					glyph = '▓'
+				} else {
+					glyph = '▒'
+				}
+				canvas[row][col] = glyph
+				color := p.cyan
+				if level > 0.6 {
+					color = p.pink
+				} else if level > 0.3 {
+					color = p.magenta
+				}
+				colors[row][col] = color
+			}
+			// peak hold ring
+			peakR := innerRadius + peak*(maxRadius-innerRadius)*0.85
+			if math.Abs(r-peakR) < 0.6 {
+				canvas[row][col] = '·'
+				colors[row][col] = p.text.Bold(true)
+			}
+		}
+	}
+	// center label
+	label := []rune(" VYNL ")
+	lx := int(cx) - len(label)/2
+	ly := int(cy)
+	for i, ch := range label {
+		if ly >= 0 && ly < templateHeight && lx+i >= 0 && lx+i < templateWidth {
+			canvas[ly][lx+i] = ch
+			colors[ly][lx+i] = p.magenta.Bold(true)
+		}
+	}
+	// render
+	rows := make([]string, templateHeight)
+	for row := range canvas {
+		var b strings.Builder
+		for col, g := range canvas[row] {
+			if g == ' ' {
+				b.WriteRune(' ')
+			} else {
+				b.WriteString(colors[row][col].Render(string(g)))
+			}
+		}
+		rows[row] = b.String()
 	}
 	return rows
 }
