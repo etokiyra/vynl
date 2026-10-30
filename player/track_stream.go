@@ -23,6 +23,7 @@ type trackStream struct {
 	transport   *transportStreamer
 	sampleRate  int
 	trackGainDB float64
+	decoder     *trackDecoder // retained for capability checks and teardown
 
 	// Producer lifecycle. cancel is closed to stop the decoder goroutine; done
 	// is closed once it has exited and released the decoder. A complete (short)
@@ -68,6 +69,7 @@ func openTrackStream(index int, path string) (*trackStream, error) {
 		stream.ring = newCompletePCMRing(initial)
 	}
 	stream.transport = newStreamingTransport(stream.ring, outputRate)
+	stream.decoder = decoder
 	if more {
 		stream.startProducer(decoder)
 	} else {
@@ -140,24 +142,20 @@ func (t *trackStream) startProducer(decoder *trackDecoder) {
 }
 
 // maxRepositionDiscard bounds how far a consumer seek may be served by
-// decoding ahead instead of repositioning the decoder.
-//
-// Repositioning costs a decoder Seek, which is not always cheap: a FLAC
-// decoder without a seek table decodes the entire stream just to index its
-// frames, so one forward skip can buffer for most of the song before a single
-// sample plays. Decoding ahead keeps the (already sequential) decoder running,
-// is bounded by the jump distance rather than the file size, and leaves the
-// ring's continuity (and the resampler's state) untouched. The ring must also
-// be able to hold the target, so a hop beyond these bounds falls back to the
-// real reposition.
+// decoding ahead instead of repositioning the decoder. Decoding ahead costs
+// the jump distance's decode time, so it only pays while the decoder reseek
+// that would otherwise run is not cheaper than the decode itself.
 const maxRepositionDiscard = 60 * outputRate
 
-// repositionSeek serves a pending consumer seek. A target at or ahead of the
-// decoded extent, small enough for the ring to hold, is served without
-// touching the decoder: the sequential decode continues under normal flow
-// control until the requested frame is covered, then the seek is acked with
-// the window intact. Everything else (backward hops, targets beyond the
-// resident capacity) uses the real reposition. In-flight cancel and
+// repositionSeek serves a pending consumer seek. Decoders that reposition
+// cheaply (FLAC with a landed frame index, or a native format) take the real
+// reseek outright: it is O(1)-ish. Everything still decodes ahead within the
+// ring's capacity, which avoids even the cheap reseek's work for small hops.
+// A decoder that cannot reposition cheaply yet - FLAC while its index is still
+// building - rolls forward under the ring's natural flow control: the
+// sequential decode chases the target across any distance without ever
+// rescanning the stream. Backward targets always take the real reseed (the
+// positioned decoder bounds its work internally). In-flight cancel and
 // newer-seek supersession are respected on both paths. The decoded/chunk
 // slices are the producer loop's own buffers, reused to stay allocation-free.
 func (t *trackStream) repositionSeek(gen uint64, frame int64, decoder *trackDecoder, decoded *[]sample, chunk *[]pcmSample) {
@@ -180,55 +178,22 @@ func (t *trackStream) repositionSeek(gen uint64, frame int64, decoder *trackDeco
 	ring.mu.Lock()
 	extent := ring.frameEndLocked()
 	space := int64(ring.capacity) - (frame - ring.base) - int64(ring.ahead)
+	fastReposition := decoder.fastSeekCapable()
 	ring.mu.Unlock()
 
-	if frame >= extent && space >= 0 && frame-extent <= maxRepositionDiscard {
-		// Decode ahead under normal flow control until the ring covers the
-		// requested frame; the window stays continuous throughout.
-		for {
-			if g, _, ok := ring.pendingSeek(); !ok || g != gen {
-				return
-			}
-			select {
-			case <-cancel:
-				ring.finish(nil)
-				return
-			default:
-			}
-			ring.mu.Lock()
-			covered := ring.frameEndLocked() >= frame
-			ring.mu.Unlock()
-			if covered {
-				ring.commitAfterDecode(gen)
-				return
-			}
-			n, more := decoder.resampled.Stream(*decoded)
-			if err := decoder.resampled.Err(); err != nil {
-				ring.finish(err)
-				return
-			}
-			if n == 0 && more {
-				ring.finish(errors.New("audio decoder made no progress"))
-				return
-			}
-			*chunk = appendPCM((*chunk)[:0], (*decoded)[:n])
-			for !ring.tryWrite(*chunk) {
-				if !ring.wait(cancel) {
-					ring.finish(nil)
-					return
-				}
-				if g, _, ok := ring.pendingSeek(); ok && g != gen {
-					return
-				}
-			}
-			if !more {
-				// EOF before the target: the container length over-declared the
-				// real content. Ack anyway; the transport sees a finished ring
-				// and ends the track through its past-end path.
-				ring.commitAfterDecode(gen)
-				return
-			}
-		}
+	if frame >= extent && !fastReposition {
+		// Reseeking this decoder means re-decoding toward the target from
+		// scratch, so decode ahead under normal flow control across any
+		// distance: the ring rolls (aged data behind the read head drops),
+		// and the seek is acked once the extent covers the requested frame.
+		t.decodeAheadTo(gen, frame, decoder, decoded, chunk)
+		return
+	}
+	if frame >= extent && frame-extent <= maxRepositionDiscard && space >= 0 {
+		// For decoders that reposition cheaply, decode ahead within the ring's
+		// rules: the window stays continuous and no reposition happens at all.
+		t.decodeAheadTo(gen, frame, decoder, decoded, chunk)
+		return
 	}
 
 	// Real reposition: reseek the decoder and reset the window to the frame.
@@ -237,6 +202,61 @@ func (t *trackStream) repositionSeek(gen uint64, frame int64, decoder *trackDeco
 		return
 	}
 	ring.commitSeek(gen, frame)
+}
+
+// decodeAheadTo serves a pending seek by running the sequential decoder under
+// normal ring flow control until the ring's extent covers the target frame,
+// then acking with the window intact (no decoder reposition, no ring reset).
+// The ring rolls naturally: once it is full, each new chunk drops aged frames
+// behind the consumer's read head from the front. Cancellation, decoder
+// errors, a decoder that stops making progress, and a newer seek while the
+// roll is running all exit cleanly; reaching EOF before the target (a
+// container that over-declares its length) acks anyway, which routes the
+// transport through its past-end end-of-track path.
+func (t *trackStream) decodeAheadTo(gen uint64, frame int64, decoder *trackDecoder, decoded *[]sample, chunk *[]pcmSample) {
+	ring := t.ring
+	cancel := t.cancel
+	for {
+		if g, _, ok := ring.pendingSeek(); !ok || g != gen {
+			return
+		}
+		select {
+		case <-cancel:
+			ring.finish(nil)
+			return
+		default:
+		}
+		ring.mu.Lock()
+		covered := ring.frameEndLocked() >= frame
+		ring.mu.Unlock()
+		if covered {
+			ring.commitAfterDecode(gen)
+			return
+		}
+		n, more := decoder.resampled.Stream(*decoded)
+		if err := decoder.resampled.Err(); err != nil {
+			ring.finish(err)
+			return
+		}
+		if n == 0 && more {
+			ring.finish(errors.New("audio decoder made no progress"))
+			return
+		}
+		*chunk = appendPCM((*chunk)[:0], (*decoded)[:n])
+		for !ring.tryWrite(*chunk) {
+			if !ring.wait(cancel) {
+				ring.finish(nil)
+				return
+			}
+			if g, _, ok := ring.pendingSeek(); ok && g != gen {
+				return
+			}
+		}
+		if !more {
+			ring.commitAfterDecode(gen)
+			return
+		}
+	}
 }
 
 // close stops the producer (if any) and waits for it to release the decoder.

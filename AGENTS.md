@@ -88,16 +88,20 @@ consecutive tracks for gapless joins) → `beep.Ctrl` → output.
   forward seek beyond the resident window cannot be served from the ring: it
   breaks into decoder reposition + refill buffering. `ensure()` decides this;
   `TestRingStaysResidentAcrossADefaultForwardSkip` guards it.
-- **Forward repositions use decode-ahead, not `decoder.Seek`**
-  (`trackStream.repositionSeek`): the sequential decoder keeps running under
-  normal flow control until the ring covers the target, then `commitAfterDecode`
-  acks with the window intact. Decoder repositioning is not uniformly cheap —
-  a FLAC without a seek table decodes the whole file inside its `Seek` just to
-  index frames (per seek, per fresh decoder) — so the producer decodes ahead
-  for hops the ring can hold (`maxRepositionDiscard`, ~60 s), and falls back
-  to the real reposition for backward or out-of-capacity targets.
-  `TestForwardSeekRepositionsViaDecodeAhead` and
-  `TestCommitAfterDecodeAckKeepsWindow` pin this.
+- **Forward repositions are index-first, never decoder re-scans**
+  (`flac_decoder.go`, `flac_seek.go`). The FLAC path uses vynl's positioned
+  decoder built on mewkiz's public frame package: a per-file frame index
+  (stored seek table when sane, else a CRC-8-validated header-only scan)
+  lands the decoder on a frame boundary near the target, and the seek
+  discards at most a few frames - O(1) for any jump into any file size,
+  which matters because mewkiz's own `Seek` re-decodes a whole seekless file
+  to index it. The index builds in the background right after load (stored
+  table published first as a coarse stage, scan upgrade replaces it) and is
+  cached per path. While an index is not yet ready, forward seeks roll:
+  `trackStream.decodeAheadTo` chases the target through normal ring flow
+  control (aged frames drop from the front) with no reposition at all;
+  backward seeks decode-discard from the data start, bounded by the target.
+  `TestForwardSeekRollsWithoutFastReposition` pins the rolling fallback.
 - `freeSpaceLocked` is monotonic in `readHead`: a backward readHead move can
   never let the producer overwrite frames the consumer still needs.
 - A seek requested by the consumer is answered by `commitSeek` or
@@ -108,7 +112,7 @@ consecutive tracks for gapless joins) → `beep.Ctrl` → output.
 - After EOF the producer stays alive (draining wakes) so backward/restart
   seeks can re-enter decoding. `ringView.pastEnd` (finished ring, window
   beyond its extent) tells the transport a buffering wait is really track end;
-  an *empty* ring is not past end — it is a fresh/seeked window the producer
+  an *empty* ring is not past end - it is a fresh/seeked window the producer
   can still fill.
 
 ### Gapless/crossfade rules

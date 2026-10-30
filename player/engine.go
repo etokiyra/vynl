@@ -12,7 +12,6 @@ import (
 
 	"github.com/etokiyra/vynl/library"
 	"github.com/gopxl/beep"
-	"github.com/gopxl/beep/flac"
 	"github.com/gopxl/beep/mp3"
 	"github.com/gopxl/beep/speaker"
 	"github.com/gopxl/beep/vorbis"
@@ -1055,9 +1054,33 @@ func (e *Engine) publish() {
 
 const initialBufferFrames = outputRate
 
+// decoderCore unifies the format-specific decode primitives behind a
+// trackDecoder: it yields stereo float samples at the track's native rate and
+// can reposition by native frame. The beep decoders (mp3/wav/ogg) satisfy this
+// directly; FLAC uses vynl's positioned decoder (flac_decoder.go), whose seek
+// does not re-decode the stream.
+type decoderCore interface {
+	Stream([]sample) (n int, ok bool)
+	Err() error
+	Len() int
+	Seek(position int) error
+	Close() error
+}
+
+// fastSeekCapable reports whether the decoder can reposition cheaply, without
+// a stream-wide scan or discard. Decoders with a custom positioning story
+// announce it through a fastSeek() capability method (FLAC reports whether its
+// frame index has landed); everything else repositions natively.
+func (d *trackDecoder) fastSeekCapable() bool {
+	if p, ok := d.stream.(interface{ fastSeek() bool }); ok {
+		return p.fastSeek()
+	}
+	return true
+}
+
 type trackDecoder struct {
-	file        *os.File
-	stream      beep.StreamSeekCloser
+	file        *os.File // owned by the beep decoders (mp3/wav/ogg); flac closes its own
+	stream      decoderCore
 	resampled   *beep.Resampler
 	inRate      beep.SampleRate
 	totalFrames int
@@ -1077,35 +1100,69 @@ func openTrackDecoder(path string) (*trackDecoder, error) {
 	if err != nil {
 		return nil, err
 	}
-	var stream beep.StreamSeekCloser
-	var format beep.Format
+	var stream decoderCore
+	var inRate beep.SampleRate
 	switch ext {
 	case ".mp3":
-		stream, format, err = mp3.Decode(file)
+		var format beep.Format
+		var raw beep.StreamSeekCloser
+		raw, format, err = mp3.Decode(file)
+		stream = decoderStream{raw}
+		inRate = format.SampleRate
 	case ".flac":
-		stream, format, err = flac.Decode(file)
+		// vynl's positioned decoder owns the file; the wrapper that beep used
+		// re-scans the whole stream inside Seek for files without a seek
+		// table.
+		stream, err = newFlacDecoder(path)
+		file.Close() // owned (and closed) by the positioned decoder
+		file = nil
+		if err == nil {
+			inRate = beep.SampleRate(stream.(*flacDecoder).inRate)
+		}
 	case ".wav":
-		stream, format, err = wav.Decode(file)
+		var format beep.Format
+		var raw beep.StreamSeekCloser
+		raw, format, err = wav.Decode(file)
+		stream = decoderStream{raw}
+		inRate = format.SampleRate
 	case ".ogg":
-		stream, format, err = vorbis.Decode(file)
+		var format beep.Format
+		var raw beep.StreamSeekCloser
+		raw, format, err = vorbis.Decode(file)
+		stream = decoderStream{raw}
+		inRate = format.SampleRate
 	}
 	if err != nil {
-		file.Close()
+		if file != nil {
+			file.Close()
+		}
 		return nil, err
 	}
-	if format.SampleRate <= 0 {
-		stream.Close()
-		file.Close()
+	if inRate <= 0 {
+		_ = stream.Close()
+		if file != nil {
+			file.Close()
+		}
 		return nil, errors.New("audio stream has invalid sample rate")
 	}
-	totalFrames := int(math.Round(float64(stream.Len()) * float64(outputRate) / float64(format.SampleRate)))
+	totalFrames := int(math.Round(float64(stream.Len()) * float64(outputRate) / float64(inRate)))
 	return &trackDecoder{
 		file: file, stream: stream,
-		resampled:   beep.Resample(4, format.SampleRate, beep.SampleRate(outputRate), stream),
-		inRate:      format.SampleRate,
+		resampled:   beep.Resample(4, inRate, beep.SampleRate(outputRate), stream),
+		inRate:      inRate,
 		totalFrames: totalFrames,
 	}, nil
 }
+
+// decoderStream adapts a beep StreamSeekCloser to decoderCore. beep's decode
+// layers return (0, false) at their ends, and decodeInitial relies on that.
+type decoderStream struct{ s beep.StreamSeekCloser }
+
+func (w decoderStream) Stream(out []sample) (int, bool) { return w.s.Stream(out) }
+func (w decoderStream) Err() error                      { return w.s.Err() }
+func (w decoderStream) Len() int                        { return w.s.Len() }
+func (w decoderStream) Seek(position int) error         { return w.s.Seek(position) }
+func (w decoderStream) Close() error                    { return w.s.Close() }
 
 func (d *trackDecoder) close() {
 	if d.stream != nil {
@@ -1117,7 +1174,6 @@ func (d *trackDecoder) close() {
 		d.file = nil
 	}
 }
-
 func (d *trackDecoder) decodeInitial(target int) ([]pcmSample, bool, error) {
 	decoded := make([]sample, 4096)
 	var initial []pcmSample
