@@ -2025,7 +2025,7 @@ func vinylArt(width int, phase float64, p palette, accents ...lipgloss.Style) []
 			distance := math.Sqrt(dx*dx + dy*dy)
 			for ringIndex, radius := range ringRadii {
 				if math.Abs(distance-radius) <= 0.52 {
-					canvas[row][column] = []rune("#O*+=")[ringIndex]
+					canvas[row][column] = []rune(":;oO+")[ringIndex]
 					break
 				}
 			}
@@ -2066,16 +2066,16 @@ func vinylArt(width int, phase float64, p palette, accents ...lipgloss.Style) []
 		for _, glyph := range line {
 			style := p.cyan
 			switch glyph {
-			case '#':
-				style = outerAccent
-			case 'O':
+			case ':':
+				style = p.muted
+			case ';':
 				style = p.cyan
-			case '*':
+			case 'o':
 				style = p.magenta
-			case '+':
+			case 'O':
 				style = p.pink
-			case '=':
-				style = p.green
+			case '+':
+				style = outerAccent
 			}
 			rendered.WriteString(style.Render(string(glyph)))
 		}
