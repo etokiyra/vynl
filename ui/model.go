@@ -2154,7 +2154,16 @@ func spectrumRing(width int, spectrum, hold [player.SpectrumBands]float64, phase
 			// Amplify so quiet passages still deform visibly.
 			level = math.Min(1, math.Max(0.08, level*2.0))
 			peak = math.Min(1, math.Max(0.08, peak*2.0))
-			outer := innerRadius + level*(maxRadius-innerRadius)*0.95
+			// A slow rotating ripple keeps low-energy regions (e.g. the
+			// high-frequency arc) from collapsing into a plain circle.
+			ripple := 0.7 * math.Sin(angle*4-phase*1.2)
+			outer := innerRadius + level*(maxRadius-innerRadius)*0.95 + ripple
+			if outer < innerRadius+0.5 {
+				outer = innerRadius + 0.5
+			}
+			if outer > maxRadius {
+				outer = maxRadius
+			}
 			if r <= outer {
 				// shade by depth into the ring
 				depth := (outer - r) / (outer - innerRadius + 0.01)
@@ -2175,10 +2184,16 @@ func spectrumRing(width int, spectrum, hold [player.SpectrumBands]float64, phase
 				}
 				colors[row][col] = color
 			}
-			// Peak energy is expressed by brightening the outermost cells of
-			// the deformation instead of drawing a separate dotted ring, which
-			// read as the old concentric disc.
-			if r > outer-0.8 && level > 0.5 {
+			// peak hold ring
+			peakR := innerRadius + peak*(maxRadius-innerRadius)*0.95 + ripple
+			if peakR < innerRadius+0.5 {
+				peakR = innerRadius + 0.5
+			}
+			if peakR > maxRadius {
+				peakR = maxRadius
+			}
+			if math.Abs(r-peakR) < 0.6 {
+				canvas[row][col] = '·'
 				colors[row][col] = p.text.Bold(true)
 			}
 		}
