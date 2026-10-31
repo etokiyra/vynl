@@ -1461,7 +1461,7 @@ func (m Model) deckPanel(width, height int, p palette) string {
 		}
 	}
 	showVinyl := inner >= 52 && height >= 20
-	vinylWidth := min(31, max(25, inner/3))
+	vinylWidth := min(41, max(29, inner/3))
 	infoWidth := inner
 	if showVinyl {
 		infoWidth = max(1, inner-vinylWidth-2)
@@ -2123,7 +2123,7 @@ func spectrumRing(width int, spectrum, hold [player.SpectrumBands]float64, phase
 	cx, cy := float64((templateWidth-1)/2), float64((templateHeight-1)/2)
 	aspect := 2.0
 	maxRadius := math.Min(cx, cy*aspect)
-	innerRadius := maxRadius * 0.50
+	innerRadius := maxRadius * 0.45
 	bars := 48
 	for row := 0; row < templateHeight; row++ {
 		for col := 0; col < templateWidth; col++ {
@@ -2151,7 +2151,10 @@ func spectrumRing(width int, spectrum, hold [player.SpectrumBands]float64, phase
 			}
 			level := spectrum[band]
 			peak := hold[band]
-			outer := innerRadius + level*(maxRadius-innerRadius)*0.85
+			// Amplify so quiet passages still deform visibly.
+			level = math.Min(1, level*1.7)
+			peak = math.Min(1, peak*1.7)
+			outer := innerRadius + level*(maxRadius-innerRadius)*0.95
 			if r <= outer {
 				// shade by depth into the ring
 				depth := (outer - r) / (outer - innerRadius + 0.01)
@@ -2173,7 +2176,7 @@ func spectrumRing(width int, spectrum, hold [player.SpectrumBands]float64, phase
 				colors[row][col] = color
 			}
 			// peak hold ring
-			peakR := innerRadius + peak*(maxRadius-innerRadius)*0.85
+			peakR := innerRadius + peak*(maxRadius-innerRadius)*0.95
 			if math.Abs(r-peakR) < 0.6 {
 				canvas[row][col] = '·'
 				colors[row][col] = p.text.Bold(true)
