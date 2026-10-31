@@ -2146,6 +2146,9 @@ func spectrumRing(width int, spectrum, hold [player.SpectrumBands]float64, phase
 				bandAngle -= 2 * math.Pi
 			}
 			barIndex := int(bandAngle / (2 * math.Pi) * float64(bars))
+			if barIndex < 0 {
+				barIndex = 0
+			}
 			if barIndex >= bars {
 				barIndex = bars - 1
 			}
