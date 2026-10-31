@@ -2139,6 +2139,9 @@ func spectrumRing(width int, spectrum, hold [player.SpectrumBands]float64, phase
 			}
 			rot := phase * 0.25
 			bandAngle := angle - rot
+			if bandAngle < 0 {
+				bandAngle += 2 * math.Pi
+			}
 			if bandAngle >= 2*math.Pi {
 				bandAngle -= 2 * math.Pi
 			}
