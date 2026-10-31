@@ -2137,14 +2137,7 @@ func spectrumRing(width int, spectrum, hold [player.SpectrumBands]float64, phase
 			if angle < 0 {
 				angle += 2 * math.Pi
 			}
-			rot := phase * 0.25
-			bandAngle := angle - rot
-			if bandAngle < 0 {
-				bandAngle += 2 * math.Pi
-			}
-			if bandAngle >= 2*math.Pi {
-				bandAngle -= 2 * math.Pi
-			}
+			bandAngle := angle
 			barIndex := int(bandAngle / (2 * math.Pi) * float64(bars))
 			if barIndex < 0 {
 				barIndex = 0
@@ -2223,7 +2216,7 @@ func spectrumRing(width int, spectrum, hold [player.SpectrumBands]float64, phase
 			if diff > math.Pi {
 				diff = 2*math.Pi - diff
 			}
-			if diff < 0.45 {
+			if diff < 0.7 {
 				style = p.text.Bold(true)
 			}
 			b.WriteString(style.Render(string(g)))
