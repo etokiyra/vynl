@@ -2123,7 +2123,7 @@ func spectrumRing(width int, spectrum, hold [player.SpectrumBands]float64, phase
 	cx, cy := float64((templateWidth-1)/2), float64((templateHeight-1)/2)
 	aspect := 2.0
 	maxRadius := math.Min(cx, cy*aspect)
-	innerRadius := maxRadius * 0.45
+	innerRadius := maxRadius * 0.40
 	bars := 48
 	for row := 0; row < templateHeight; row++ {
 		for col := 0; col < templateWidth; col++ {
@@ -2152,8 +2152,8 @@ func spectrumRing(width int, spectrum, hold [player.SpectrumBands]float64, phase
 			level := spectrum[band]
 			peak := hold[band]
 			// Amplify so quiet passages still deform visibly.
-			level = math.Min(1, level*1.7)
-			peak = math.Min(1, peak*1.7)
+			level = math.Min(1, math.Max(0.12, level*2.4))
+			peak = math.Min(1, math.Max(0.12, peak*2.4))
 			outer := innerRadius + level*(maxRadius-innerRadius)*0.95
 			if r <= outer {
 				// shade by depth into the ring
