@@ -97,33 +97,36 @@ const (
 )
 
 type Model struct {
-	tracks         []library.Track
-	visible        []int
-	engine         *player.Engine
-	config         config.Config
-	status         player.Status
-	statusAt       time.Time
-	loaded         trackDetails
-	width          int
-	height         int
-	frame          int
-	wheelPhase     float64
-	rmsLevel       float64
-	rmsTarget      float64
-	channelLevel   [2]float64
-	channelTarget  [2]float64
-	bassLevel      float64
-	bassTarget     float64
-	spectrum       [player.SpectrumBands]float64
-	spectrumTarget [player.SpectrumBands]float64
-	spectrumHold   [player.SpectrumBands]float64
-	selected       int
-	eqBand         int
-	search         string
-	searching      bool
-	deckFocused    bool
-	showHelp       bool
-	sortKey        trackSort
+	tracks           []library.Track
+	visible          []int
+	engine           *player.Engine
+	config           config.Config
+	status           player.Status
+	statusAt         time.Time
+	loaded           trackDetails
+	width            int
+	height           int
+	frame            int
+	wheelPhase       float64
+	rmsLevel         float64
+	rmsTarget        float64
+	channelLevel     [2]float64
+	channelTarget    [2]float64
+	bassLevel        float64
+	bassTarget       float64
+	spectrum         [player.SpectrumBands]float64
+	spectrumTarget   [player.SpectrumBands]float64
+	spectrumHold     [player.SpectrumBands]float64
+	selected         int
+	eqBand           int
+	search           string
+	searching        bool
+	deckFocused      bool
+	showHelp         bool
+	showSettings     bool
+	settingsSelected int
+	addingToPlaylist bool
+	sortKey          trackSort
 
 	// Playlists. playlistDir is where they are stored; playlists holds the
 	// loaded set; browse selects which list the browser shows; openPlaylist is
@@ -235,6 +238,13 @@ func (m Model) Update(message tea.Msg) (tea.Model, tea.Cmd) {
 	switch msg := message.(type) {
 	case tea.WindowSizeMsg:
 		m.width, m.height = msg.Width, msg.Height
+	case tea.MouseMsg:
+		switch msg.Button {
+		case tea.MouseButtonWheelUp:
+			m.moveSelection(-3)
+		case tea.MouseButtonWheelDown:
+			m.moveSelection(3)
+		}
 	case tickMsg:
 		if m.status.Playing {
 			m.frame++
@@ -364,6 +374,55 @@ func (m Model) updateKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		m.showHelp = false
 		return m, nil
 	}
+	if m.showSettings {
+		presets := themePresets()
+		switch key {
+		case "esc":
+			m.showSettings = false
+		case "up":
+			if m.settingsSelected > 0 {
+				m.settingsSelected--
+			}
+		case "down":
+			if m.settingsSelected < len(presets)-1 {
+				m.settingsSelected++
+			}
+		case "enter":
+			if m.settingsSelected >= 0 && m.settingsSelected < len(presets) {
+				m.config.Theme = presets[m.settingsSelected].theme
+			}
+			m.showSettings = false
+		}
+		return m, nil
+	}
+	if m.addingToPlaylist {
+		switch key {
+		case "esc":
+			m.addingToPlaylist = false
+			m.searching = false
+			m.search = ""
+			m.refreshVisible()
+		case "enter":
+			if len(m.visible) > 0 {
+				m.addSelectedToPlaylist()
+			}
+		case "up":
+			m.moveSelection(-1)
+		case "down":
+			m.moveSelection(1)
+		case "backspace":
+			if len(m.search) > 0 {
+				m.search = m.search[:len(m.search)-1]
+				m.refreshVisible()
+			}
+		default:
+			if len(msg.Runes) > 0 {
+				m.search += library.StripControl(string(msg.Runes))
+				m.refreshVisible()
+			}
+		}
+		return m, nil
+	}
 	// Boundary/page navigation works in the library list (and the search box);
 	// the playlist browser keeps its own cursor.
 	if m.browse == viewLibrary && m.handleNavigation(key) {
@@ -421,16 +480,27 @@ func (m Model) updateKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		return m, tea.Quit
 	case key == "?":
 		m.showHelp = true
+	case key == "f2":
+		m.showSettings = true
+		m.settingsSelected = 0
 	case key == "tab":
 		m.deckFocused = !m.deckFocused
 	case key == keys.Playlists:
 		m.toggleBrowse()
 	case key == keys.Search:
-		m.browse = viewLibrary
-		m.searching = true
-		m.search = ""
-		m.selected = 0
-		m.refreshVisible()
+		if m.browse == viewPlaylists && m.openPlaylist >= 0 {
+			m.addingToPlaylist = true
+			m.searching = true
+			m.search = ""
+			m.selected = 0
+			m.refreshVisible()
+		} else {
+			m.browse = viewLibrary
+			m.searching = true
+			m.search = ""
+			m.selected = 0
+			m.refreshVisible()
+		}
 	case key == keys.Toggle:
 		m.engine.Send(player.Command{Action: player.Toggle})
 	case key == keys.Stop:
@@ -745,7 +815,6 @@ func (m *Model) startLibraryPlayback(index int) tea.Cmd {
 	}
 	m.active = viewLibrary
 	m.activePlaylist = -1
-	m.deckFocused = true
 	return tea.Batch(pending...)
 }
 
@@ -1029,7 +1098,7 @@ func indexOfPlaylist(lists []playlist.Playlist, file string) int {
 
 // browserPanel renders whichever list the user is browsing.
 func (m Model) browserPanel(width, height int, p palette) string {
-	if m.browse == viewPlaylists {
+	if m.browse == viewPlaylists && !m.addingToPlaylist {
 		return m.playlistPanel(width, height, p)
 	}
 	return m.libraryPanel(width, height, p)
@@ -1115,14 +1184,20 @@ func (m Model) playlistEntryLines(inner, contentHeight int, p palette) []string 
 		}
 	}
 	header := fmt.Sprintf("%s  %d entries", name, len(m.playlistTracks))
+	if m.status.Shuffle {
+		header += "  SHUFFLE"
+	}
+	if m.status.Repeat != player.RepeatOff {
+		header += "  REPEAT " + strings.ToUpper(string(m.status.Repeat))
+	}
 	if missing > 0 {
 		header += fmt.Sprintf("  %d unavailable", missing)
 	}
 	lines := []string{
 		p.text.Bold(true).Render(truncate(header, inner, "…")),
-		p.muted.Render("↑↓ browse   ENTER play   " + keyLabel(keys.PlaylistAdd) + " add playing   " +
-			keyLabel(keys.PlaylistAddSelected) + " add selected   " + keyLabel(keys.PlaylistDelete) + " remove"),
-		p.muted.Render(keyLabel(keys.PlaylistMoveUp) + "/" + keyLabel(keys.PlaylistMoveDown) + " reorder   " +
+		p.muted.Render("↑↓ browse   ENTER play   " + keyLabel(keys.Search) + " add tracks   " +
+			keyLabel(keys.PlaylistAdd) + " add playing   " + keyLabel(keys.PlaylistDelete) + " remove"),
+		p.muted.Render(keyLabel(keys.Shuffle) + " shuffle   " + keyLabel(keys.Repeat) + " repeat   " +
 			keyLabel(keys.PlaylistRename) + " rename   ESC back"),
 	}
 	if len(m.playlistTracks) == 0 {
@@ -1249,6 +1324,9 @@ func (m Model) View() string {
 	if m.showHelp && m.width >= 24 && m.height >= 12 {
 		return m.helpOverlay(palette)
 	}
+	if m.showSettings && m.width >= 30 && m.height >= 12 {
+		return m.settingsOverlay(palette)
+	}
 	if m.width < 24 || m.height < 12 {
 		return compactRoot(m, palette)
 	}
@@ -1289,15 +1367,21 @@ func (m Model) View() string {
 		liveFrames := []string{"·", "•", "*", "•"}
 		live = liveFrames[(m.frame/6)%len(liveFrames)]
 	}
-	header := palette.cyan.Bold(true).Render("VYNL") + palette.muted.Render("  /  ANALOG AUDIO CONSOLE") + palette.green.Render("  "+live+" LIVE")
+	header := palette.cyan.Bold(true).Render("◉ VYNL") + palette.muted.Render("  /  ANALOG AUDIO CONSOLE") + palette.green.Render("  "+live+" LIVE")
+	if width := lipgloss.Width(header); width < innerWidth {
+		header = strings.Repeat(" ", (innerWidth-width)/2) + header
+	}
 	header = fixedBlock(header, innerWidth, headerHeight, palette.background)
 	eq := m.eqPanel(innerWidth, eqHeight, palette)
 	help := m.helpLine(palette)
+	if width := lipgloss.Width(help); width < innerWidth {
+		help = strings.Repeat(" ", (innerWidth-width)/2) + help
+	}
 	help = fixedBlock(help, innerWidth, footerHeight, palette.background)
 	inner := lipgloss.JoinVertical(lipgloss.Left, header, body, eq, help)
 	inner = fixedBlock(inner, innerWidth, innerHeight, palette.background)
 	return lipgloss.NewStyle().Foreground(palette.foregroundColor).
-		Width(innerWidth).Height(innerHeight).Border(lipgloss.RoundedBorder()).BorderForeground(palette.cyan.GetForeground()).
+		Width(innerWidth).Height(innerHeight).Border(lipgloss.DoubleBorder()).BorderForeground(palette.cyan.GetForeground()).
 		Render(inner)
 }
 
@@ -1323,14 +1407,14 @@ func (m Model) helpLine(p palette) string {
 			"? help",
 			keyLabel(keys.Quit) + " quit",
 		}
-		return p.muted.Render(strings.Join(parts, "  "))
+		return p.muted.Render(strings.Join(parts, "  │  "))
 	}
-	return p.muted.Render("↑/↓ browse   ENTER load   " + keyLabel(keys.Search) +
-		" find   " + keyLabel(keys.Sort) + " sort   " + keyLabel(keys.Playlists) + " playlists   " +
-		keyLabel(keys.Rescan) + " rescan   " +
-		keyLabel(keys.Toggle) + " play   " +
-		keyLabel(keys.Next) + "/" + keyLabel(keys.Prev) + " track   " +
-		keyLabel(keys.NowPlaying) + " now   TAB deck   ? help   " + keyLabel(keys.Quit) + " quit")
+	return p.muted.Render("↑/↓ browse  │  ENTER load  │  " + keyLabel(keys.Search) +
+		" find  │  " + keyLabel(keys.Sort) + " sort  │  " + keyLabel(keys.Playlists) + " playlists  │  " +
+		keyLabel(keys.Rescan) + " rescan  │  " +
+		keyLabel(keys.Toggle) + " play  │  " +
+		keyLabel(keys.Next) + "/" + keyLabel(keys.Prev) + " track  │  " +
+		keyLabel(keys.NowPlaying) + " now  │  TAB deck  │  ? help  │  " + keyLabel(keys.Quit) + " quit")
 }
 
 // keyLabel renders a configured key in a form that reads well in the help bar.
@@ -1423,6 +1507,12 @@ func (m Model) helpOverlay(p palette) string {
 			p.text.Render(padRight(entry.action, actionWidth))
 		rendered[column] = append(rendered[column], line)
 	}
+	gridWidth := columns*entryWidth + (columns-1)*gap
+	leftPad := 0
+	if gridWidth < innerWidth {
+		leftPad = (innerWidth - gridWidth) / 2
+	}
+	pad := strings.Repeat(" ", leftPad)
 	grid := make([]string, 0, rows)
 	for row := 0; row < rows; row++ {
 		parts := make([]string, 0, columns)
@@ -1431,13 +1521,41 @@ func (m Model) helpOverlay(p palette) string {
 				parts = append(parts, rendered[column][row])
 			}
 		}
-		grid = append(grid, strings.Join(parts, strings.Repeat(" ", gap)))
+		grid = append(grid, pad+strings.Join(parts, strings.Repeat(" ", gap)))
 	}
 	title := p.cyan.Bold(true).Render("KEYBINDINGS") + p.muted.Render("    press any key to close")
+	if width := lipgloss.Width(title); width < innerWidth {
+		title = strings.Repeat(" ", (innerWidth-width)/2) + title
+	}
 	body := title + "\n\n" + strings.Join(grid, "\n")
 	inner := fixedBlock(body, innerWidth, innerHeight, p.background)
 	return p.background.Width(innerWidth).Height(innerHeight).
-		Border(lipgloss.RoundedBorder()).BorderForeground(p.cyan.GetForeground()).Render(inner)
+		Border(lipgloss.DoubleBorder()).BorderForeground(p.cyan.GetForeground()).Render(inner)
+}
+
+// settingsOverlay renders a theme picker.
+func (m Model) settingsOverlay(p palette) string {
+	innerWidth, innerHeight := max(1, m.width-2), max(1, m.height-2)
+	presets := themePresets()
+	lines := []string{
+		p.cyan.Bold(true).Render("SETTINGS") + p.muted.Render("    press ESC to close"),
+		"",
+		p.muted.Render("THEME (ENTER apply)"),
+	}
+	for i, preset := range presets {
+		label := "  " + preset.name
+		if i == m.settingsSelected {
+			label = "▶ " + preset.name
+			lines = append(lines, p.cyan.Bold(true).Render(label))
+		} else {
+			lines = append(lines, p.text.Render(label))
+		}
+	}
+	lines = append(lines, "", p.muted.Render("↑/↓ choose   ENTER apply   ESC close"))
+	body := strings.Join(lines, "\n")
+	inner := fixedBlock(body, innerWidth, innerHeight, p.background)
+	return p.background.Width(innerWidth).Height(innerHeight).
+		Border(lipgloss.DoubleBorder()).BorderForeground(p.cyan.GetForeground()).Render(inner)
 }
 
 func padRight(text string, width int) string {
@@ -1527,7 +1645,7 @@ func (m Model) deckPanel(width, height int, p palette) string {
 	baseLines := append([]string(nil), top...)
 	marker := p.muted.Render("[ PAUSED ]")
 	if m.status.Playing {
-		icons := []string{">>>", "> >", ">>>", " > "}
+		icons := []string{"▶", "►", "▶", "▷"}
 		marker = p.green.Bold(true).Render("[ " + icons[(m.frame/6)%len(icons)] + " PLAYING ]")
 	}
 	modes := []string{"VINYL " + boolLabel(m.status.Vinyl)}
@@ -1615,7 +1733,7 @@ func (m Model) libraryPanel(width, height int, p palette) string {
 		if artist == "" {
 			artist = filepathBase(track.Path)
 		}
-		marker := "  "
+		marker := "♪ "
 		if m.status.Track.Path != "" && track.Path == m.status.Track.Path {
 			marker = "▶ "
 		}
@@ -1638,7 +1756,11 @@ func (m Model) libraryPanel(width, height int, p palette) string {
 	lines = append(lines, metaLines...)
 	meterRows := max(0, contentHeight-len(lines))
 	lines = append(lines, stereoMeterLines(meterRows, m.visualChannels(), m.metersActive(), p)...)
-	return panel("LIBRARY / BROWSER", strings.Join(lines, "\n"), width, height, p.magenta, p.background)
+	title := "LIBRARY / BROWSER"
+	if m.addingToPlaylist {
+		title = "ADD TRACKS TO PLAYLIST"
+	}
+	return panel(title, strings.Join(lines, "\n"), width, height, p.magenta, p.background)
 }
 
 func stereoMeterLines(height int, rms [2]float64, playing bool, p palette) []string {
@@ -1991,7 +2113,7 @@ func panel(title, content string, width, height int, accent, base lipgloss.Style
 	innerWidth, innerHeight := max(1, width-4), max(1, height-2)
 	text := accent.Bold(true).Render(title) + "\n" + content
 	text = fitTerminal(text, innerWidth, innerHeight)
-	return base.Width(innerWidth).Height(innerHeight).Padding(0, 1).Border(lipgloss.RoundedBorder()).
+	return base.Width(innerWidth).Height(innerHeight).Padding(0, 1).Border(lipgloss.DoubleBorder()).
 		BorderForeground(accent.GetForeground()).Render(text)
 }
 
@@ -2476,7 +2598,7 @@ func compactRoot(m Model, p palette) string {
 		)
 	}
 	inner := fixedBlock(strings.Join(lines, "\n"), innerWidth, innerHeight, p.background)
-	return p.background.Width(innerWidth).Height(innerHeight).Border(lipgloss.RoundedBorder()).
+	return p.background.Width(innerWidth).Height(innerHeight).Border(lipgloss.DoubleBorder()).
 		BorderForeground(p.cyan.GetForeground()).Render(inner)
 }
 
@@ -2631,6 +2753,24 @@ func formatBytes(size int64) string {
 		unit++
 	}
 	return strconv.FormatFloat(value, 'f', 1, 64) + " " + units[unit]
+}
+
+// themePresets returns the built-in colour themes selectable from the settings
+// overlay. They are applied for the session (config.toml is never rewritten).
+func themePresets() []struct {
+	name  string
+	theme config.Theme
+} {
+	return []struct {
+		name  string
+		theme config.Theme
+	}{
+		{"Catppuccin", config.Theme{Foreground: "#cdd6f4", Cyan: "#89dceb", Magenta: "#cba6f7", Green: "#a6e3a1", Muted: "#6c7086", Pink: "#f5c2e7", Error: "#f38ba8"}},
+		{"Dracula", config.Theme{Foreground: "#f8f8f2", Cyan: "#8be9fd", Magenta: "#bd93f9", Green: "#50fa7b", Muted: "#6272a4", Pink: "#ff79c6", Error: "#ff5555"}},
+		{"Nord", config.Theme{Foreground: "#eceff4", Cyan: "#88c0d0", Magenta: "#b48ead", Green: "#a3be8c", Muted: "#4c566a", Pink: "#d08770", Error: "#bf616a"}},
+		{"Gruvbox", config.Theme{Foreground: "#ebdbb2", Cyan: "#83a598", Magenta: "#d3869b", Green: "#b8bb26", Muted: "#928374", Pink: "#fb4934", Error: "#cc241d"}},
+		{"Solarized", config.Theme{Foreground: "#839496", Cyan: "#2aa198", Magenta: "#6c71c4", Green: "#859900", Muted: "#586e75", Pink: "#d33682", Error: "#dc322f"}},
+	}
 }
 
 func (m Model) palette() palette {

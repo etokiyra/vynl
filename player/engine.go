@@ -60,6 +60,9 @@ type Command struct {
 	Action Action
 	Value  float64
 	Band   int
+	// NoAutoplay, when set on a Select command, loads the track without
+	// starting playback (used for the initial load at startup).
+	NoAutoplay bool
 	// Tracks is the complete replacement list for SetTracks; Revision is a
 	// caller-assigned generation token echoed back in Status.
 	Tracks   []library.Track
@@ -217,7 +220,7 @@ func NewEngine(tracks []library.Track, initial InitialState) (*Engine, error) {
 	e.control = &beep.Ctrl{Streamer: e.queue, Paused: true}
 	speaker.Play(e.control)
 	go e.run()
-	e.Send(Command{Action: Select, Value: 0})
+	e.Send(Command{Action: Select, Value: 0, NoAutoplay: true})
 	return e, nil
 }
 
@@ -351,7 +354,7 @@ func (e *Engine) handle(command Command) {
 	case Select:
 		index := int(command.Value)
 		if index >= 0 && index < len(e.tracks) {
-			e.selectTrack(index, true)
+			e.selectTrack(index, !command.NoAutoplay)
 		}
 	case SetTracks:
 		e.replaceTracks(command.Tracks, command.Revision)

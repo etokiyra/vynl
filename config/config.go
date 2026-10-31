@@ -119,13 +119,13 @@ func Defaults() Config {
 	return Config{
 		MusicDir: filepath.Join(home, "Music"),
 		Theme: Theme{
-			Foreground: "#e8edf2",
-			Cyan:       "#45e6dc",
-			Magenta:    "#f05bd5",
-			Green:      "#b7f36b",
-			Muted:      "#78828e",
-			Pink:       "#ff77c8",
-			Error:      "#ff6b6b",
+			Foreground: "#cdd6f4",
+			Cyan:       "#89dceb",
+			Magenta:    "#cba6f7",
+			Green:      "#a6e3a1",
+			Muted:      "#6c7086",
+			Pink:       "#f5c2e7",
+			Error:      "#f38ba8",
 		},
 		Keybindings: Keybindings{
 			Toggle: " ", Stop: "s", Next: "n", Prev: "p", SeekBack: "left", SeekForward: "right",

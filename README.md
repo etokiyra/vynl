@@ -73,7 +73,8 @@ transparent terminals like kitty, foot, or Alacritty.
   `replaygain_album_gain` tags (Vorbis comments and ID3v2 TXXX), with track or
   album mode and a preamp; off by default
 - ⌨️ **Discoverable keymap** — context-sensitive footer hints plus a full-screen
-  `?` keybinding reference
+  `?` keybinding reference, an `F2` settings overlay with premade themes, and
+  mouse-wheel navigation in lists
 - 🖥️ **Responsive layout** — side-by-side deck and library on wide terminals, a
   stacked layout when narrow, and a compact view on tiny terminals
 - 🖤 **Terminal-native transparency** — no hardcoded backgrounds; your
@@ -158,6 +159,7 @@ vynl -version
 | `Esc`         | Cancel search / close the open playlist / leave the playlist browser |
 | `F5`          | Rescan the music folder                   |
 | `?`           | Show the full keybinding help    |
+| `F2`          | Open the settings overlay (theme picker) |
 | `Ctrl+C`      | Quit (always, even while searching) |
 | `q`           | Quit                              |
 

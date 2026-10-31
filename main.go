@@ -98,6 +98,7 @@ func main() {
 	program := tea.NewProgram(
 		ui.NewModel(tracks, engine, cfg).WithTagUpdates(tagUpdates, stopScan).WithPlaylists(playlistDir, playlists),
 		tea.WithAltScreen(),
+		tea.WithMouseCellMotion(),
 	)
 	finalModel, runErr := program.Run()
 
