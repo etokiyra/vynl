@@ -2152,8 +2152,11 @@ func spectrumRing(width int, spectrum, hold [player.SpectrumBands]float64, phase
 			level := spectrum[band]
 			peak := hold[band]
 			// Amplify so quiet passages still deform visibly.
-			level = math.Min(1, math.Max(0.08, level*2.0))
-			peak = math.Min(1, math.Max(0.08, peak*2.0))
+			// Boost higher bands so the high-frequency arc (bottom-right) still
+			// deforms instead of collapsing into a plain ring.
+			gain := 1.0 + 0.6*float64(band)/float64(player.SpectrumBands)
+			level = math.Min(1, math.Max(0.08, level*2.0*gain))
+			peak = math.Min(1, math.Max(0.08, peak*2.0*gain))
 			// A slow rotating ripple keeps low-energy regions (e.g. the
 			// high-frequency arc) from collapsing into a plain circle.
 			ripple := 0.7 * math.Sin(angle*4-phase*1.2)
