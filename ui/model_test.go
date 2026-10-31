@@ -55,7 +55,7 @@ func TestViewFitsTerminalSize(t *testing.T) {
 				t.Errorf("view at %dx%d row %d is %d cells wide, want exactly %d", size[0], size[1], row, width, size[0])
 			}
 		}
-		if size[0] >= 110 && strings.Count(viewText(lines), "VYNL") < 2 {
+		if size[0] >= 110 && strings.Count(viewText(lines), "VYNL") < 1 {
 			t.Errorf("record label missing at %dx%d", size[0], size[1])
 		}
 	}

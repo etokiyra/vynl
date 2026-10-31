@@ -1498,7 +1498,7 @@ func (m Model) deckPanel(width, height int, p palette) string {
 	)
 	top := info
 	if showVinyl {
-		art := spectrumRing(vinylWidth, m.spectrum, m.spectrumHold, m.wheelPhase, p)
+		art := morphSpectrum(vinylWidth, m.spectrum, m.spectrumHold, m.wheelPhase, p)
 		for len(info) < len(art) {
 			info = append(info, "")
 		}
@@ -2187,6 +2187,94 @@ func spectrumRing(width int, spectrum, hold [player.SpectrumBands]float64, phase
 		if ly >= 0 && ly < templateHeight && lx+i >= 0 && lx+i < templateWidth {
 			canvas[ly][lx+i] = ch
 			colors[ly][lx+i] = p.magenta.Bold(true)
+		}
+	}
+	rows := make([]string, templateHeight)
+	for row := range canvas {
+		var b strings.Builder
+		for col, g := range canvas[row] {
+			if g == ' ' {
+				b.WriteRune(' ')
+			} else {
+				b.WriteString(colors[row][col].Render(string(g)))
+			}
+		}
+		rows[row] = b.String()
+	}
+	return rows
+}
+
+func morphSpectrum(width int, spectrum, hold [player.SpectrumBands]float64, phase float64, p palette) []string {
+	templateWidth := max(21, min(41, width))
+	if templateWidth%2 == 0 {
+		templateWidth--
+	}
+	templateHeight := templateWidth / 2
+	if templateHeight%2 == 0 {
+		templateHeight++
+	}
+	canvas := make([][]rune, templateHeight)
+	colors := make([][]lipgloss.Style, templateHeight)
+	for row := range canvas {
+		canvas[row] = []rune(strings.Repeat(" ", templateWidth))
+		colors[row] = make([]lipgloss.Style, templateWidth)
+		for col := range colors[row] {
+			colors[row][col] = p.muted
+		}
+	}
+	cx, cy := float64((templateWidth-1)/2), float64((templateHeight-1)/2)
+	aspect := 2.0
+	maxRadius := math.Min(cx, cy*aspect)
+	bars := 48
+	for row := 0; row < templateHeight; row++ {
+		for col := 0; col < templateWidth; col++ {
+			dx := float64(col) - cx
+			dy := (float64(row) - cy) * aspect
+			r := math.Sqrt(dx*dx + dy*dy)
+			if r > maxRadius {
+				continue
+			}
+			angle := math.Atan2(dy, dx)
+			if angle < 0 {
+				angle += 2 * math.Pi
+			}
+			barIndex := int(angle / (2 * math.Pi) * float64(bars))
+			if barIndex < 0 {
+				barIndex = 0
+			}
+			if barIndex >= bars {
+				barIndex = bars - 1
+			}
+			band := barIndex * (player.SpectrumBands / bars)
+			if band >= player.SpectrumBands {
+				band = player.SpectrumBands - 1
+			}
+			level := spectrum[band]
+			// morphing contour: spectrum + rotating ripple
+			ripple := 0.25*math.Sin(angle*3-phase*0.8) + 0.15*math.Sin(angle*7+phase*1.3)
+			contour := maxRadius * (0.35 + 0.55*level + ripple*level)
+			if contour < maxRadius*0.15 {
+				contour = maxRadius * 0.15
+			}
+			if r <= contour {
+				depth := 1 - r/contour
+				glyph := '░'
+				if depth > 0.66 {
+					glyph = '█'
+				} else if depth > 0.33 {
+					glyph = '▓'
+				} else {
+					glyph = '▒'
+				}
+				canvas[row][col] = glyph
+				color := p.cyan
+				if level > 0.6 {
+					color = p.pink
+				} else if level > 0.3 {
+					color = p.magenta
+				}
+				colors[row][col] = color
+			}
 		}
 	}
 	rows := make([]string, templateHeight)
