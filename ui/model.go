@@ -2137,7 +2137,8 @@ func spectrumRing(width int, spectrum, hold [player.SpectrumBands]float64, phase
 			if angle < 0 {
 				angle += 2 * math.Pi
 			}
-			bandAngle := angle + phase*0.5
+			rot := phase * 0.25
+			bandAngle := angle - rot
 			if bandAngle >= 2*math.Pi {
 				bandAngle -= 2 * math.Pi
 			}
@@ -2194,7 +2195,8 @@ func spectrumRing(width int, spectrum, hold [player.SpectrumBands]float64, phase
 		}
 	}
 	// render
-	markerAngle := math.Mod(phase*math.Pi/4, 2*math.Pi)
+	rot := math.Mod(phase*0.25, 2*math.Pi)
+	markerAngle := rot
 	rows := make([]string, templateHeight)
 	for row := range canvas {
 		var b strings.Builder
