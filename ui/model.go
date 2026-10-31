@@ -2123,22 +2123,24 @@ func spectrumRing(width int, spectrum, hold [player.SpectrumBands]float64, phase
 	cx, cy := float64((templateWidth-1)/2), float64((templateHeight-1)/2)
 	aspect := 2.0
 	maxRadius := math.Min(cx, cy*aspect)
-	innerRadius := maxRadius * 0.40
+	// Fixed-thickness ring: the shape never collapses or notches; music drives
+	// color/brightness instead of radial thickness.
+	innerRadius := maxRadius * 0.62
+	outerRadius := maxRadius * 0.86
 	bars := 48
 	for row := 0; row < templateHeight; row++ {
 		for col := 0; col < templateWidth; col++ {
 			dx := float64(col) - cx
 			dy := (float64(row) - cy) * aspect
 			r := math.Sqrt(dx*dx + dy*dy)
-			if r < innerRadius-0.5 || r > maxRadius+0.5 {
+			if r < innerRadius-0.5 || r > outerRadius+0.5 {
 				continue
 			}
 			angle := math.Atan2(dy, dx)
 			if angle < 0 {
 				angle += 2 * math.Pi
 			}
-			bandAngle := angle
-			barIndex := int(bandAngle / (2 * math.Pi) * float64(bars))
+			barIndex := int(angle / (2 * math.Pi) * float64(bars))
 			if barIndex < 0 {
 				barIndex = 0
 			}
@@ -2151,49 +2153,28 @@ func spectrumRing(width int, spectrum, hold [player.SpectrumBands]float64, phase
 			}
 			level := spectrum[band]
 			peak := hold[band]
-			// Amplify so quiet passages still deform visibly.
-			// Boost higher bands so the high-frequency arc (bottom-right) still
-			// deforms instead of collapsing into a plain ring.
 			gain := 1.0 + 0.6*float64(band)/float64(player.SpectrumBands)
-			level = math.Min(1, math.Max(0.08, level*2.0*gain))
-			peak = math.Min(1, math.Max(0.08, peak*2.0*gain))
-			outer := innerRadius + level*(maxRadius-innerRadius)*0.95
-			if outer < innerRadius+0.5 {
-				outer = innerRadius + 0.5
+			level = math.Min(1, math.Max(0, level*1.8*gain))
+			peak = math.Min(1, math.Max(0, peak*1.8*gain))
+			glyph := '░'
+			if level > 0.6 {
+				glyph = '█'
+			} else if level > 0.3 {
+				glyph = '▓'
+			} else if level > 0.1 {
+				glyph = '▒'
 			}
-			if outer > maxRadius {
-				outer = maxRadius
+			canvas[row][col] = glyph
+			color := p.muted
+			if level > 0.6 {
+				color = p.pink
+			} else if level > 0.3 {
+				color = p.magenta
+			} else if level > 0.1 {
+				color = p.cyan
 			}
-			if r <= outer {
-				// shade by depth into the ring
-				depth := (outer - r) / (outer - innerRadius + 0.01)
-				glyph := '░'
-				if depth > 0.66 {
-					glyph = '█'
-				} else if depth > 0.33 {
-					glyph = '▓'
-				} else {
-					glyph = '▒'
-				}
-				canvas[row][col] = glyph
-				color := p.cyan
-				if level > 0.6 {
-					color = p.pink
-				} else if level > 0.3 {
-					color = p.magenta
-				}
-				colors[row][col] = color
-			}
-			// peak hold ring
-			peakR := innerRadius + peak*(maxRadius-innerRadius)*0.95
-			if peakR < innerRadius+0.5 {
-				peakR = innerRadius + 0.5
-			}
-			if peakR > maxRadius {
-				peakR = maxRadius
-			}
-			if math.Abs(r-peakR) < 0.6 {
-				canvas[row][col] = '·'
+			colors[row][col] = color
+			if r > outerRadius-1.2 && peak > 0.45 {
 				colors[row][col] = p.text.Bold(true)
 			}
 		}
@@ -2208,17 +2189,15 @@ func spectrumRing(width int, spectrum, hold [player.SpectrumBands]float64, phase
 			colors[ly][lx+i] = p.magenta.Bold(true)
 		}
 	}
-	// render
 	rows := make([]string, templateHeight)
 	for row := range canvas {
 		var b strings.Builder
 		for col, g := range canvas[row] {
 			if g == ' ' {
 				b.WriteRune(' ')
-				continue
+			} else {
+				b.WriteString(colors[row][col].Render(string(g)))
 			}
-			style := colors[row][col]
-			b.WriteString(style.Render(string(g)))
 		}
 		rows[row] = b.String()
 	}
