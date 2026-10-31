@@ -2209,8 +2209,6 @@ func spectrumRing(width int, spectrum, hold [player.SpectrumBands]float64, phase
 		}
 	}
 	// render
-	rot := math.Mod(phase*0.25, 2*math.Pi)
-	markerAngle := rot
 	rows := make([]string, templateHeight)
 	for row := range canvas {
 		var b strings.Builder
@@ -2220,20 +2218,6 @@ func spectrumRing(width int, spectrum, hold [player.SpectrumBands]float64, phase
 				continue
 			}
 			style := colors[row][col]
-			// rotating sheen to emphasize spin
-			dx := float64(col) - cx
-			dy := (float64(row) - cy) * aspect
-			angle := math.Atan2(dy, dx)
-			if angle < 0 {
-				angle += 2 * math.Pi
-			}
-			diff := math.Abs(angle - markerAngle)
-			if diff > math.Pi {
-				diff = 2*math.Pi - diff
-			}
-			if diff < 0.7 {
-				style = p.text.Bold(true)
-			}
 			b.WriteString(style.Render(string(g)))
 		}
 		rows[row] = b.String()
