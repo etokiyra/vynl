@@ -2157,10 +2157,7 @@ func spectrumRing(width int, spectrum, hold [player.SpectrumBands]float64, phase
 			gain := 1.0 + 0.6*float64(band)/float64(player.SpectrumBands)
 			level = math.Min(1, math.Max(0.08, level*2.0*gain))
 			peak = math.Min(1, math.Max(0.08, peak*2.0*gain))
-			// A slow rotating ripple keeps low-energy regions (e.g. the
-			// high-frequency arc) from collapsing into a plain circle.
-			ripple := 0.7 * math.Sin(angle*4-phase*1.2)
-			outer := innerRadius + level*(maxRadius-innerRadius)*0.95 + ripple
+			outer := innerRadius + level*(maxRadius-innerRadius)*0.95
 			if outer < innerRadius+0.5 {
 				outer = innerRadius + 0.5
 			}
@@ -2188,7 +2185,7 @@ func spectrumRing(width int, spectrum, hold [player.SpectrumBands]float64, phase
 				colors[row][col] = color
 			}
 			// peak hold ring
-			peakR := innerRadius + peak*(maxRadius-innerRadius)*0.95 + ripple
+			peakR := innerRadius + peak*(maxRadius-innerRadius)*0.95
 			if peakR < innerRadius+0.5 {
 				peakR = innerRadius + 0.5
 			}
