@@ -2231,7 +2231,7 @@ func morphSpectrum(width int, spectrum, hold [player.SpectrumBands]float64, phas
 			dx := float64(col) - cx
 			dy := (float64(row) - cy) * aspect
 			r := math.Sqrt(dx*dx + dy*dy)
-			if r > maxRadius {
+			if r > maxRadius+1.5 {
 				continue
 			}
 			angle := math.Atan2(dy, dx)
@@ -2245,35 +2245,42 @@ func morphSpectrum(width int, spectrum, hold [player.SpectrumBands]float64, phas
 			if barIndex >= bars {
 				barIndex = bars - 1
 			}
-			band := barIndex * (player.SpectrumBands / bars)
-			if band >= player.SpectrumBands {
-				band = player.SpectrumBands - 1
-			}
+			// Pseudo-random band mapping so energy lands in unpredictable spots.
+			band := int(math.Abs(math.Sin(float64(barIndex)*12.9898+78.233) * 43758.5453))
+			band = band % player.SpectrumBands
 			level := spectrum[band]
-			// morphing contour: spectrum + rotating ripple
-			ripple := 0.25*math.Sin(angle*3-phase*0.8) + 0.15*math.Sin(angle*7+phase*1.3)
-			contour := maxRadius * (0.35 + 0.55*level + ripple*level)
-			if contour < maxRadius*0.15 {
-				contour = maxRadius * 0.15
+			// Multi-frequency rotating ripple for organic morphing.
+			ripple := 0.16*math.Sin(angle*3-phase*0.9) +
+				0.10*math.Sin(angle*7+phase*1.4) +
+				0.05*math.Sin(angle*13-phase*2.1)
+			contour := maxRadius * (0.42 + 0.50*level + ripple*0.5)
+			if contour < maxRadius*0.20 {
+				contour = maxRadius * 0.20
 			}
 			if r <= contour {
 				depth := 1 - r/contour
 				glyph := '░'
-				if depth > 0.66 {
+				if depth > 0.7 {
 					glyph = '█'
-				} else if depth > 0.33 {
+				} else if depth > 0.4 {
 					glyph = '▓'
-				} else {
+				} else if depth > 0.15 {
 					glyph = '▒'
 				}
 				canvas[row][col] = glyph
-				color := p.cyan
-				if level > 0.6 {
+				color := p.muted
+				if level > 0.55 {
 					color = p.pink
-				} else if level > 0.3 {
+				} else if level > 0.25 {
 					color = p.magenta
+				} else if level > 0.05 {
+					color = p.cyan
 				}
 				colors[row][col] = color
+			} else if r <= contour+1.2 {
+				// soft glow at the edge
+				canvas[row][col] = '·'
+				colors[row][col] = p.muted
 			}
 		}
 	}
