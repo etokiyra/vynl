@@ -25,6 +25,15 @@ type tickMsg time.Time
 type statusMsg player.Status
 type trackDetailsMsg trackDetails
 
+// NowPlaying receives each status snapshot together with the UI's tagged track
+// metadata. The MPRIS service implements it; keeping it an interface here means
+// the TUI stays independent of any desktop integration and tests can use a
+// stub. The engine's own track copy only has filename fallbacks, so metadata
+// must come from the UI list.
+type NowPlaying interface {
+	Publish(player.Status, library.Track)
+}
+
 // tagBatchMsg carries one batch of incremental tag metadata; tagScanDoneMsg is
 // emitted once when the scan stream closes. Both carry the scan generation so a
 // batch from a superseded scan (e.g. one already queued when a rescan starts)
@@ -101,6 +110,7 @@ type Model struct {
 	visible          []int
 	engine           *player.Engine
 	config           config.Config
+	nowPlaying       NowPlaying
 	status           player.Status
 	statusAt         time.Time
 	loaded           trackDetails
@@ -198,6 +208,14 @@ func (m Model) WithPlaylists(dir string, lists []playlist.Playlist) Model {
 	m.openPlaylist = -1
 	m.activePlaylist = -1
 	m.confirmDelete = -1
+	return m
+}
+
+// WithNowPlaying attaches an optional publisher for the OS/desktop media
+// integration (MPRIS on Linux). It is separate from NewModel so tests and
+// headless runs need no bus connection.
+func (m Model) WithNowPlaying(nowPlaying NowPlaying) Model {
+	m.nowPlaying = nowPlaying
 	return m
 }
 
@@ -302,6 +320,11 @@ func (m Model) Update(message tea.Msg) (tea.Model, tea.Cmd) {
 			commands = append(commands,
 				loadTrackDetails(track.Path),
 				tea.SetWindowTitle(windowTitle(track)))
+		}
+		// Desktop media integration gets the tagged track from the UI, not the
+		// engine's filename-only fallback. Publish never blocks.
+		if m.nowPlaying != nil {
+			m.nowPlaying.Publish(m.status, track)
 		}
 		if !wasPlaying && m.status.Playing {
 			commands = append(commands, tick())

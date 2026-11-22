@@ -924,6 +924,56 @@ func TestEngineSeekCancelsCrossfade(t *testing.T) {
 	}
 }
 
+// TestEnginePlayPauseAreIdempotent pins the explicit actions remote controls
+// use: repeating Pause or Play must not flip the deck the other way (Toggle is
+// only for the single-key binding).
+func TestEnginePlayPauseAreIdempotent(t *testing.T) {
+	path := writeTestWAV(t, 1, 44100)
+	engine := engineWithTracks(t, []library.Track{{Path: path}})
+	t.Cleanup(engine.shutdownStreams)
+	engine.selectTrack(0, true)
+	if !engine.playing {
+		t.Fatal("autoplay selection did not start playback")
+	}
+
+	engine.handle(Command{Action: Pause})
+	engine.handle(Command{Action: Pause})
+	if engine.playing {
+		t.Fatal("repeated Pause started playback")
+	}
+
+	engine.handle(Command{Action: Play})
+	engine.handle(Command{Action: Play})
+	if !engine.playing {
+		t.Fatal("repeated Play did not leave playback running")
+	}
+}
+
+// TestEngineSeekToPositionsAbsolutely pins the absolute-seek command used by
+// desktop media controls: it must land on the requested point (not a delta) and
+// clamp requests beyond the decoded extent.
+func TestEngineSeekToPositionsAbsolutely(t *testing.T) {
+	path := writeTestWAV(t, 5, 44100)
+	engine := engineWithTracks(t, []library.Track{{Path: path}})
+	t.Cleanup(engine.shutdownStreams)
+	engine.selectTrack(0, true)
+
+	engine.handle(Command{Action: SeekTo, Value: 3})
+	if got := engine.current.transport.PositionSeconds(); math.Abs(got-3) > 0.01 {
+		t.Fatalf("absolute seek landed at %.3f seconds, want 3", got)
+	}
+
+	engine.handle(Command{Action: SeekTo, Value: 100})
+	if got := engine.current.transport.PositionSeconds(); math.Abs(got-5) > 0.01 {
+		t.Fatalf("seek beyond the track landed at %.3f seconds, want 5", got)
+	}
+
+	engine.handle(Command{Action: SeekTo, Value: -2})
+	if got := engine.current.transport.PositionSeconds(); got != 0 {
+		t.Fatalf("negative seek landed at %.3f seconds, want 0", got)
+	}
+}
+
 // TestEngineNextDuringCrossfade checks the deterministic behavior of a manual
 // skip during an active fade: both the incoming and outgoing streams are
 // abandoned and the requested track is installed immediately.

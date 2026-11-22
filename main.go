@@ -14,6 +14,7 @@ import (
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/etokiyra/vynl/config"
 	"github.com/etokiyra/vynl/library"
+	"github.com/etokiyra/vynl/mpris"
 	"github.com/etokiyra/vynl/player"
 	"github.com/etokiyra/vynl/playlist"
 	"github.com/etokiyra/vynl/ui"
@@ -95,11 +96,34 @@ func main() {
 		fmt.Fprintf(os.Stderr, "vynl: ignoring unreadable playlists: %v\n", playlistErr)
 	}
 
+	model := ui.NewModel(tracks, engine, cfg).
+		WithTagUpdates(tagUpdates, stopScan).
+		WithPlaylists(playlistDir, playlists)
+
+	// Publish "now playing" on the session bus so desktop shells and widgets
+	// (waybar, quickshell/end-4, lock screens) can show and control playback.
+	// It is optional: a headless or macOS session without a bus keeps playing.
+	var nowPlaying *mpris.Service
+	if service, err := mpris.New(engine); err != nil {
+		if runtime.GOOS == "linux" {
+			fmt.Fprintf(os.Stderr, "vynl: desktop media integration unavailable: %v\n", err)
+		}
+	} else {
+		nowPlaying = service
+		defer nowPlaying.Close()
+		model = model.WithNowPlaying(nowPlaying)
+	}
+
 	program := tea.NewProgram(
-		ui.NewModel(tracks, engine, cfg).WithTagUpdates(tagUpdates, stopScan).WithPlaylists(playlistDir, playlists),
+		model,
 		tea.WithAltScreen(),
 		tea.WithMouseCellMotion(),
 	)
+	if nowPlaying != nil {
+		// Quit through MPRIS follows the same path as pressing q: the event
+		// loop exits, main persists state and tears the engine down.
+		nowPlaying.SetQuit(program.Quit)
+	}
 	finalModel, runErr := program.Run()
 
 	// A rescan replaces the initial scan context with its own; cancel whatever

@@ -1277,3 +1277,41 @@ func TestRMSAnimationEasesToRestAfterPause(t *testing.T) {
 		t.Fatalf("paused amplitude failed to settle: started %.3f, ended %.3f, pending %t", start, model.rmsLevel, model.hasPendingEase())
 	}
 }
+
+type recordedNowPlaying struct {
+	calls  int
+	status player.Status
+	track  library.Track
+}
+
+func (r *recordedNowPlaying) Publish(status player.Status, track library.Track) {
+	r.calls++
+	r.status = status
+	r.track = track
+}
+
+func TestStatusPublishesTaggedTrackToNowPlaying(t *testing.T) {
+	tagged := library.Track{Path: "/music/a.flac", Title: "Tagged Title", Artist: "Artist", Album: "Album"}
+	recorder := &recordedNowPlaying{}
+	model := NewModel([]library.Track{tagged}, &player.Engine{}, config.Defaults()).WithNowPlaying(recorder)
+	// The engine's copy only knows the filename fallback; the desktop-facing
+	// snapshot must use the UI's tagged metadata instead.
+	model.status = player.Status{
+		Track: library.Track{Path: tagged.Path, Title: "filename"},
+		Count: 1, Duration: 3,
+	}
+
+	updated, _ := model.Update(statusMsg(model.status))
+	if recorder.calls != 1 {
+		t.Fatalf("now-playing calls = %d, want 1", recorder.calls)
+	}
+	if recorder.track != tagged {
+		t.Fatalf("published track = %+v, want %+v", recorder.track, tagged)
+	}
+	if recorder.status.Duration != 3 {
+		t.Fatalf("published duration = %.1f, want 3", recorder.status.Duration)
+	}
+	if updated.(Model).status.Track.Path != tagged.Path {
+		t.Fatalf("status track path = %q, want %q", updated.(Model).status.Track.Path, tagged.Path)
+	}
+}

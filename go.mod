@@ -7,6 +7,7 @@ require (
 	github.com/charmbracelet/lipgloss v1.1.0
 	github.com/charmbracelet/x/ansi v0.10.1
 	github.com/dhowden/tag v0.0.0-20240417053706-3d75831295e8
+	github.com/godbus/dbus/v5 v5.2.4
 	github.com/gopxl/beep v1.4.1
 	github.com/mewkiz/flac v1.0.8
 	github.com/pelletier/go-toml/v2 v2.2.4

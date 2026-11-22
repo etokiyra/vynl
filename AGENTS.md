@@ -13,6 +13,7 @@ engine that wraps [beep](https://github.com/gopxl/beep) decoders. See
 main.go        wiring: config/state load, library scan, engine start, TUI run
 config/        TOML config + persisted state.toml
 library/       music-folder walk, parallel async tag reading, ReplayGain tags
+mpris/         optional Linux MPRIS v2 export (session bus, metadata, controls)
 playlist/      M3U8 load/save (atomic, bounded)
 player/        the audio engine — the concurrency-sensitive core
 ui/            Bubble Tea model (deck, library, playlists, visualizer)
@@ -128,6 +129,27 @@ consecutive tracks for gapless joins) → `beep.Ctrl` → output.
 - Crossfade state (`fading`, `fadePos`, `fadeTotal`) lives in the queue and is
   reset by `cancelFade`/`setPrimary`/`clear`; the engine's runtime crossfade
   knobs mirror into `q.crossfade` under the lock (`setCrossfadeMS`).
+
+## Desktop integration (mpris/)
+
+- `mpris/` is optional and must never affect playback: a missing session bus
+  disables it, and `main` keeps running. It imports `player` for commands but
+  `player`/`ui` must not import it (the UI depends only on its small
+  `NowPlaying` interface).
+- The UI is the metadata source. The engine's `Track` copy only carries filename
+  fallbacks, so `ui.Model` publishes `(Status, currentTrack())`; pulling
+  metadata straight from engine status would lose tags and artist/album.
+- `Service.Publish` is a non-blocking one-slot mailbox (latest wins) consumed by
+  the service goroutine. Keep all bus I/O off the Bubble Tea event loop, and
+  never call `prop.Set*` while holding `Service.mu` (writable-property callbacks
+  take it under godbus's property lock).
+- godbus's `Export` only registers methods whose last return is `*dbus.Error`.
+  Keep that return on every MPRIS method, and use `ExportWithMap` for the one
+  Go-name indirection (`SeekRelative` -> D-Bus `Seek`, so `go vet` does not
+  confuse it with `io.Seeker`).
+- MPRIS `Position` is int64 microseconds, is updated without
+  `PropertiesChanged` (`EmitFalse`), and jumps are announced with `Seeked`.
+  `SetPosition` must ignore a stale `mpris:trackid`.
 
 ## Conventions
 

@@ -23,11 +23,21 @@ const outputRate = 44100
 type Action string
 
 const (
-	Toggle  Action = "toggle"
-	Stop    Action = "stop"
-	Next    Action = "next"
-	Prev    Action = "previous"
-	Seek    Action = "seek"
+	Toggle Action = "toggle"
+	// Play and Pause are idempotent explicit requests, used by remote controls
+	// whose view of playback state may be a status tick behind. Toggle stays
+	// the keyboard's single-key action.
+	Play  Action = "play"
+	Pause Action = "pause"
+	Stop  Action = "stop"
+	Next  Action = "next"
+	Prev  Action = "previous"
+	Seek  Action = "seek"
+	// SeekTo seeks to an absolute position in seconds. It exists alongside the
+	// relative Seek because desktop media controls (MPRIS SetPosition) address
+	// an absolute point and a relative jump computed from a slightly stale
+	// status would drift.
+	SeekTo  Action = "seekto"
 	Restart Action = "restart"
 	Volume  Action = "volume"
 	Mute    Action = "mute"
@@ -336,6 +346,10 @@ func (e *Engine) handle(command Command) {
 			e.playing = !e.control.Paused
 			speaker.Unlock()
 		}
+	case Play:
+		e.setPlaying(true)
+	case Pause:
+		e.setPlaying(false)
 	case Stop:
 		if e.current != nil {
 			e.cancelFade()
@@ -363,6 +377,15 @@ func (e *Engine) handle(command Command) {
 			e.cancelFade()
 			speaker.Lock()
 			e.current.transport.Seek(e.current.transport.PositionSeconds() + command.Value)
+			speaker.Unlock()
+		}
+	case SeekTo:
+		if e.current != nil {
+			e.cancelFade()
+			speaker.Lock()
+			// transport.Seek clamps to the track's known extent, so callers can
+			// pass an unclamped MPRIS position safely.
+			e.current.transport.Seek(command.Value)
 			speaker.Unlock()
 		}
 	case Restart:
@@ -591,6 +614,19 @@ func (e *Engine) installPrimary(stream *trackStream, autoplay bool) {
 
 // stopCurrent retires every stream and silences the queue, which stays
 // installed. Used for hard track changes.
+// setPlaying applies an explicit play/pause request under the speaker lock. It
+// is idempotent so a remote command based on a slightly stale status snapshot
+// cannot accidentally flip the deck the other way.
+func (e *Engine) setPlaying(playing bool) {
+	if e.current == nil {
+		return
+	}
+	speaker.Lock()
+	e.control.Paused = !playing
+	e.playing = playing
+	speaker.Unlock()
+}
+
 func (e *Engine) stopCurrent() {
 	speaker.Lock()
 	e.queue.clear()

@@ -55,6 +55,10 @@ transparent terminals like kitty, foot, or Alacritty.
   stored beside your config. Add the playing track, the highlighted library
   track, or the whole filtered library; reorder and remove entries; and play
   through a playlist with the same gapless/crossfade engine and Next/Prev order
+- 🖥️ **Desktop media integration** — publishes now-playing over MPRIS on Linux,
+  so waybar, quickshell/end-4, lock screens and `playerctl` show the title,
+  artist, album, duration and artwork, and can play, pause, skip, seek and
+  change volume remotely
 - 🕹️ **Live playback controls** — toggle crossfade and change its duration, and
   cycle ReplayGain mode / adjust the preamp, all while VYNL is running; tempo,
   pitch, volume, and EQ were already live
@@ -312,6 +316,26 @@ Tempo, pitch, volume, and the EQ bands were already live. Changing a setting
 applies to the current track, the prefetched next track, and any in-progress
 crossfade without restarting playback.
 
+### Desktop media integration (MPRIS)
+
+On Linux, VYNL publishes itself on the session bus as
+`org.mpris.MediaPlayer2.vynl`, so desktop shells, panels and lock screens can
+show and control playback exactly like any other media player. This needs no
+configuration: if a session bus is available it is used automatically, and if
+not (a minimal or headless session, or macOS) VYNL keeps playing normally and
+prints one warning on Linux.
+
+The published metadata includes the tagged title, artist, album, track length,
+a stable per-file track ID, and the local file URL. If the track's folder
+contains a conventional cover image (`cover.jpg`, `folder.png`, `front.jpg`,
+`albumart.jpg` and similar), it is exposed as `mpris:artUrl` for now-playing
+thumbnails. VYNL does not extract embedded artwork.
+
+Remote clients such as waybar, quickshell/end-4, GNOME/KDE media widgets, and
+`playerctl` can play, pause, stop, go next/previous, seek relative or absolute,
+set the playback rate within 0.5–2×, change volume, and set loop/shuffle mode.
+`Quit` follows the normal shutdown path, so playback state is still saved.
+
 ---
 
 ## Playlists
@@ -368,6 +392,11 @@ VYNL is built around a few core pieces:
   bounded parsing, relative-path handling) and validates entry paths; the UI
   owns the in-memory playlist state and hands a playlist to the engine as its
   track list.
+- **`mpris/`** — the optional Linux desktop integration. Exports
+  `org.mpris.MediaPlayer2` and `.Player` on the session bus, mirrors engine
+  status into MPRIS properties, and translates remote methods back into engine
+  commands. It sits beside the TUI: the UI publishes tagged metadata to it and
+  it never touches the audio path.
 - **`config/`** — TOML config loading with sensible defaults when no config
   file is present.
 
@@ -409,6 +438,10 @@ command/status channels.
   shown, not removed, when they go missing, and the same track may appear more
   than once on purpose. Crossfade and ReplayGain changes are session-only; only
   volume, mute, EQ, shuffle, vinyl, and repeat are persisted
+- MPRIS is Linux-only and requires a D-Bus session bus. Artwork comes from a
+  conventional cover image in the track's folder, not embedded tags, and VYNL
+  always keeps a track loaded, so a paused deck is reported as `Paused` rather
+  than `Stopped`
 - Untrusted tag metadata and filenames are stripped of control characters and
   length-bounded before display, so terminal escape sequences in tags or paths
   are neutralised rather than rendered
@@ -451,6 +484,8 @@ order.
 - [x] **Auto-skip corrupt tracks** — an unplayable file is skipped
       automatically (bounded by the library size) and the deck reports how many
       were passed over, so one bad file never stalls a session
+- [x] **Desktop media integration** — VYNL publishes now-playing metadata and
+      playback controls over MPRIS on the Linux session bus
 
 ### Quality
 
